@@ -9,6 +9,10 @@
 
 No more shipping to prod and realising you forgot `STRIPE_API_KEY`.
 
+
+![envsleuth demo](demo.gif)
+
+
 ## Install
 
 ```bash
