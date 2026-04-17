@@ -160,6 +160,59 @@ def _count_files(root: Path, exts, excludes) -> int:
     return len(iter_python_files(root, extensions=exts, extra_excludes=excludes))
 
 
+# ------------------------------------------------------------------- generate
+
+@cli.command()
+@click.option(
+    "--path", "-p",
+    type=click.Path(exists=True, file_okay=True, dir_okay=True, path_type=Path),
+    default=".",
+)
+@click.option(
+    "--output", "-o",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Where to write the example file. Defaults to ./.env.example",
+)
+@click.option("--force", "-f", is_flag=True, help="Overwrite if output file exists.")
+@click.option("--no-color", is_flag=True)
+@click.option("--exclude", multiple=True)
+@click.option("--ext", multiple=True)
+def generate(
+    path: Path,
+    output: Optional[Path],
+    force: bool,
+    no_color: bool,
+    exclude: tuple,
+    ext: tuple,
+) -> None:
+    """Generate a .env.example file from scanned code."""
+
+    root = path.resolve()
+    if output is None:
+        output = Path.cwd() / ".env.example"
+
+    use_color = should_use_color(force=False if no_color else None)
+
+    exts: Optional[Set[str]] = None
+    if ext:
+        exts = {".py"} | {e if e.startswith(".") else f".{e}" for e in ext}
+    extra_excl: Optional[Set[str]] = set(exclude) if exclude else None
+
+    result = scan_project(root, extensions=exts, extra_excludes=extra_excl)
+
+    try:
+        write_env_example(result, output, force=force)
+    except FileExistsError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(2)
+
+    n = len(result.static_names)
+    msg = f"Wrote {n} variable{'s' if n != 1 else ''} to {output}"
+    if use_color:
+        msg = f"\033[32m✓\033[0m {msg}"
+    click.echo(msg)
+
 
 if __name__ == "__main__":
     cli()
