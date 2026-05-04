@@ -21,40 +21,55 @@ HEADER = """\
 # Replace the empty values with real defaults/examples, but don't commit secrets.
 """
 
+# chars that mean "this needs quoting" in .env. # is for comments, $ for var
+# expansion in some parsers, the rest are obvious.
+_NEEDS_QUOTING = set(' \t#"\'$\\')
 
-def _first_literal_default(usages: List[EnvUsage]) -> Optional[str]:
-    """Try to recover a literal default value from one of the usage sites.
 
-    We already know which usages have has_default=True; this re-parses the line
-    to pull out the second arg's constant value. It's a bit of a hack but works
-    well enough for the common case.
+def _rel(p: Path) -> str:
+    """Display path relative to cwd, fall back to absolute if not possible."""
+    try:
+        return str(p.relative_to(Path.cwd()))
+    except ValueError:
+        return str(p)
+
+
+def _format_value(raw: str) -> str:
+    """Format a value for .env. Quote it if it contains anything special.
+
+    python-dotenv is forgiving but bash `source .env` and JS dotenv are not —
+    they cut at the first '#' and choke on spaces. Better to over-quote.
     """
-    # TODO: properly thread the default node through from scanner instead of
-    # re-reading the file here. Works for now.
+    if raw == "":
+        return ""
+    if any(c in _NEEDS_QUOTING for c in raw):
+        # double quotes + escape backslashes and embedded quotes
+        escaped = raw.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return raw
+
+
+def _literal_from_node(node: Optional[ast.AST]) -> Optional[str]:
+    """Pull a string default out of an AST node, if it's a literal we recognize."""
+    if node is None:
+        return None
+    if isinstance(node, ast.Constant):
+        if node.value is None:
+            return ""  # None default == "no value", same as no default for the example
+        return str(node.value)
+    # could also try to handle ast.Name pointing at a module-level constant,
+    # but that's a rabbit hole — keeping it simple
+    return None
+
+
+def _pick_default(usages: List[EnvUsage]) -> Optional[str]:
+    """First usage with a usable literal default wins."""
     for u in usages:
         if not u.has_default:
             continue
-        try:
-            source = u.file.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        try:
-            tree = ast.parse(source)
-        except SyntaxError:
-            continue
-
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            if node.lineno != u.line:
-                continue
-            # getenv(name, default) or environ.get(name, default)
-            if len(node.args) >= 2:
-                default = node.args[1]
-                if isinstance(default, ast.Constant):
-                    if default.value is None:
-                        return ""
-                    return str(default.value)
+        val = _literal_from_node(u.default_node)
+        if val is not None:
+            return val
     return None
 
 
@@ -62,7 +77,6 @@ def build_env_example(scan: ScanResult) -> str:
     """Produce the text content for a .env.example file."""
     lines: List[str] = [HEADER]
 
-    # group usages by name
     grouped: dict = {}
     for u in scan.usages:
         if u.name is None:
@@ -77,14 +91,14 @@ def build_env_example(scan: ScanResult) -> str:
         usages = grouped[name]
 
         # show up to 3 locations
-        locations = [f"{u.file}:{u.line}" for u in usages[:3]]
+        locations = [f"{_rel(u.file)}:{u.line}" for u in usages[:3]]
         if len(usages) > 3:
             locations.append(f"...and {len(usages) - 3} more")
         lines.append(f"# used at {', '.join(locations)}")
 
-        default = _first_literal_default(usages)
+        default = _pick_default(usages)
         if default is not None and default != "":
-            lines.append(f"{name}={default}")
+            lines.append(f"{name}={_format_value(default)}")
         else:
             lines.append(f"{name}=")
         lines.append("")  # blank between groups, easier to scan

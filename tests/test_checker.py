@@ -173,6 +173,85 @@ def test_check_extra_in_env_is_reported(tmp_path: Path) -> None:
     assert report.extra_in_env == ["ALSO_UNUSED", "UNUSED"]
 
 
+def test_check_extra_in_env_respects_ignore_patterns(tmp_path: Path) -> None:
+    # if user has TEST_* in .envignore they don't want TEST_FOO in .env to show up
+    # as 'extra' either — be consistent
+    code = tmp_path / "src"
+    write(code / "a.py", """
+        import os
+        os.getenv("USED")
+    """)
+    env = write(tmp_path / ".env", """
+        USED=1
+        TEST_FOO=2
+        TEST_BAR=3
+        REGULAR_UNUSED=4
+    """)
+
+    scan = scan_project(code)
+    report = check(scan, env, ignore_patterns=["TEST_*"])
+
+    assert report.extra_in_env == ["REGULAR_UNUSED"]
+
+
+def test_check_extra_in_env_respects_dynamic_usages(tmp_path: Path) -> None:
+    # bug fix: if code has os.getenv(f"PREFIX_{x}"), then PREFIX_FOO in .env
+    # is not really "unused" — it might be the runtime target. don't pester user.
+    code = tmp_path / "src"
+    write(code / "a.py", """
+        import os
+        for x in ["FOO", "BAR"]:
+            os.getenv(f"PREFIX_{x}")
+        os.getenv("REAL_VAR")
+    """)
+    env = write(tmp_path / ".env", """
+        REAL_VAR=1
+        PREFIX_FOO=2
+        PREFIX_BAR=3
+        TOTALLY_UNRELATED=4
+    """)
+
+    scan = scan_project(code)
+    report = check(scan, env)
+
+    # PREFIX_* matches the dynamic expression, only TOTALLY_UNRELATED is a real extra
+    assert report.extra_in_env == ["TOTALLY_UNRELATED"]
+
+
+def test_has_default_requires_all_usages_to_have_default(tmp_path: Path) -> None:
+    # behavior change: previously `any()` of usages had default → counted as default.
+    # now we require all usages to have default. otherwise the no-default usage
+    # site would silently fail at runtime when the env var is missing.
+    code = tmp_path / "src"
+    write(code / "a.py", """
+        import os
+        os.getenv("MAYBE_BAD")          # no default — would return None
+        os.getenv("MAYBE_BAD", "x")     # has default
+    """)
+    env = write(tmp_path / ".env", "")  # empty .env
+
+    scan = scan_project(code)
+    report = check(scan, env)
+
+    # since one site has no default, treat as required (missing)
+    assert [v.name for v in report.missing] == ["MAYBE_BAD"]
+    assert report.with_default == []
+
+
+def test_has_default_when_all_usages_have_default(tmp_path: Path) -> None:
+    code = tmp_path / "src"
+    write(code / "a.py", """
+        import os
+        os.getenv("OK", "a")
+        os.getenv("OK", "b")
+    """)
+    env = write(tmp_path / ".env", "")
+
+    scan = scan_project(code)
+    report = check(scan, env)
+    assert [v.name for v in report.with_default] == ["OK"]
+
+
 def test_check_env_file_missing(tmp_path: Path) -> None:
     code = tmp_path / "src"
     write(code / "a.py", "import os\nos.getenv('X')\n")

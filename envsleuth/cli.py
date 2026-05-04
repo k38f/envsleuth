@@ -99,7 +99,9 @@ def scan(
     root = path.resolve()
     if env_file is None:
         env_file = Path.cwd() / DEFAULT_ENV_FILE
-    env_file = env_file.resolve() if env_file.exists() else env_file
+    # always make absolute, even if file doesn't exist — otherwise the
+    # "not found" message shows just the bare name
+    env_file = env_file.absolute()
 
     if envignore is None:
         candidate = Path.cwd() / DEFAULT_ENVIGNORE_FILE
@@ -135,7 +137,16 @@ def scan(
         bar = Bar(files_preview, label="Scanning", show_eta=True, show_speed=True)
         def _tick(_f: Path) -> None:
             bar.update()
-        result = scan_project(root, extensions=exts, extra_excludes=extra_excl, on_file=_tick)
+        try:
+            result = scan_project(root, extensions=exts, extra_excludes=extra_excl, on_file=_tick)
+        finally:
+            # flashbar's API name differs across versions, just try both
+            close = getattr(bar, "close", None) or getattr(bar, "finish", None)
+            if close:
+                try:
+                    close()
+                except Exception:
+                    pass  # don't let a broken progress bar kill the report
     else:
         result = scan_project(root, extensions=exts, extra_excludes=extra_excl)
 

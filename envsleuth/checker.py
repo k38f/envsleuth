@@ -98,6 +98,49 @@ def _matches_any(name: str, patterns: List[str]) -> bool:
     return any(fnmatch.fnmatchcase(name, p) for p in patterns)
 
 
+def _looks_like_dynamic_match(name: str, dynamic_usages: List[EnvUsage]) -> bool:
+    """Heuristic: does this env var name plausibly match any of the dynamic
+    expressions we couldn't statically resolve?
+
+    Common pattern: os.getenv(f"PREFIX_{x}") — we don't know x, but if the .env
+    has PREFIX_FOO and PREFIX_BAR, those are probably the targets.
+    """
+    for u in dynamic_usages:
+        expr = u.raw_expr or ""
+        # very rough: pull out string literals from the f-string-ish expression
+        # and check if the env var starts with one of them
+        # e.g. f"PREFIX_{x}" -> we look for "PREFIX_"
+        for piece in _string_pieces(expr):
+            if piece and name.startswith(piece):
+                return True
+    return False
+
+
+def _string_pieces(expr: str) -> List[str]:
+    # crude — find anything between quotes. covers f"PREFIX_{x}" giving "PREFIX_"
+    # and "_SUFFIX" type cases. not parsing properly because expr is already
+    # ast.unparse'd source text and the form varies.
+    pieces: List[str] = []
+    i = 0
+    while i < len(expr):
+        c = expr[i]
+        if c in ('"', "'"):
+            quote = c
+            j = i + 1
+            buf = []
+            while j < len(expr) and expr[j] != quote:
+                if expr[j] == "{":
+                    break  # f-string interpolation, end of literal piece
+                buf.append(expr[j])
+                j += 1
+            if buf:
+                pieces.append("".join(buf))
+            i = j + 1
+        else:
+            i += 1
+    return pieces
+
+
 # -------------------------------------------------------------------- main api
 
 
@@ -120,7 +163,10 @@ def check(
     variables: List[VarReport] = []
     for name in sorted(by_name):
         usages = by_name[name]
-        has_default = any(u.has_default for u in usages)
+        # bug fix: was `any()` before — meant a single defaulted usage masked
+        # other call sites that would actually crash on missing var. now we
+        # only call it 'has default' if every usage provides one.
+        has_default = bool(usages) and all(u.has_default for u in usages)
         ignored = _matches_any(name, patterns)
         variables.append(
             VarReport(
@@ -133,7 +179,14 @@ def check(
         )
 
     code_names = set(by_name.keys())
-    extra_in_env = sorted(env_keys - code_names)
+    # if user told us to ignore TEST_*, they probably don't want TEST_FOO in .env
+    # showing up as "unused" either
+    extras_raw = env_keys - code_names
+    extra_in_env = sorted(
+        n for n in extras_raw
+        if not _matches_any(n, patterns)
+        and not _looks_like_dynamic_match(n, scan.dynamic_usages)
+    )
 
     return CheckReport(
         variables=variables,

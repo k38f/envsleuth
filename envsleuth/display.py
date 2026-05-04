@@ -23,7 +23,6 @@ BLUE = "\033[34m"
 CYAN = "\033[36m"
 GRAY = "\033[90m"
 
-# unused for now but might use for --verbose later
 MAX_USAGES_SHOWN = 5
 
 
@@ -237,6 +236,7 @@ def render_report_json(report: CheckReport) -> str:
     data = {
         "env_file": str(report.env_file) if report.env_file else None,
         "env_file_exists": report.env_file_exists,
+        "ignore_patterns": list(report.ignore_patterns),
         "summary": {
             "total": len(report.variables),
             "present": len(report.present),

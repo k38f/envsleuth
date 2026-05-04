@@ -172,6 +172,7 @@ pre-commit:
 | `--path`, `-p` | Directory or file to scan. Default: `.` |
 | `--output`, `-o` | Where to write. Default: `./.env.example` |
 | `--force`, `-f` | Overwrite existing output file |
+| `--no-color` | Disable ANSI colors in the success message |
 | `--exclude`, `--ext` | Same as in `scan` |
 
 ## How it compares

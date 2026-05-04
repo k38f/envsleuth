@@ -45,6 +45,10 @@ class EnvUsage:
     raw_expr: Optional[str] = None
     """For dynamic usages: text of the unresolved expression (for diagnostics)."""
 
+    default_node: Optional[ast.AST] = None
+    """The AST node of the default value, when has_default is True. Lets the
+    generator pull literal defaults without re-parsing the file."""
+
     @property
     def is_dynamic(self) -> bool:
         return self.name is None
@@ -84,19 +88,73 @@ class _EnvVisitor(ast.NodeVisitor):
         self.file_path = file_path
         self.usages: List[EnvUsage] = []
 
-        # Track import aliases. We need to recognize calls whether the user wrote
-        # `os.getenv(...)`, `import os as foo; foo.getenv(...)`, or
-        # `from os import getenv; getenv(...)`.
-        self._os_aliases: Set[str] = set()
-        self._getenv_aliases: Set[str] = set()
-        self._environ_aliases: Set[str] = set()
+        # Scope stack: each entry has its own alias sets. Nested scopes can see
+        # outer ones (lexical scoping), but outer scopes can't see inner.
+        # That way `def f(): from os import getenv as ge; ge("X")` doesn't
+        # make a stray `ge("Y")` outside the function look like an env usage.
+        # Each entry: {"kind": "module"|"function"|"class", "os":..., ...}
+        self.scopes: List[dict] = [self._fresh_scope("module")]
+
+    @staticmethod
+    def _fresh_scope(kind: str) -> dict:
+        return {"kind": kind, "os": set(), "getenv": set(), "environ": set()}
+
+    def _push_scope(self, kind: str) -> None:
+        self.scopes.append(self._fresh_scope(kind))
+
+    def _pop_scope(self) -> None:
+        self.scopes.pop()
+
+    def _all_aliases(self, kind: str) -> Set[str]:
+        # python scoping: function bodies don't see class-level names from
+        # enclosing classes (only module + enclosing functions). but a call
+        # site inside a class body itself does see the class's own imports.
+        top = self.scopes[-1]
+        out: Set[str] = set()
+        if top["kind"] == "class":
+            # class body — see everything in the chain
+            for s in self.scopes:
+                out |= s[kind]
+        else:
+            # function or module — skip class scopes (they don't leak into methods)
+            for s in self.scopes:
+                if s["kind"] == "class":
+                    continue
+                out |= s[kind]
+        return out
+
+    # -------------------------------------------------------------- scoping
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._push_scope("function")
+        try:
+            self.generic_visit(node)
+        finally:
+            self._pop_scope()
+
+    def visit_AsyncFunctionDef(self, node) -> None:
+        self._push_scope("function")
+        try:
+            self.generic_visit(node)
+        finally:
+            self._pop_scope()
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        # class bodies have their own namespace. `import os` in a class body
+        # doesn't leak into methods (those would NameError). pushing a scope
+        # mirrors that.
+        self._push_scope("class")
+        try:
+            self.generic_visit(node)
+        finally:
+            self._pop_scope()
 
     # ------------------------------------------------------------------ imports
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             if alias.name == "os":
-                self._os_aliases.add(alias.asname or "os")
+                self.scopes[-1]["os"].add(alias.asname or "os")
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
@@ -104,9 +162,9 @@ class _EnvVisitor(ast.NodeVisitor):
             for alias in node.names:
                 bound = alias.asname or alias.name
                 if alias.name == "getenv":
-                    self._getenv_aliases.add(bound)
+                    self.scopes[-1]["getenv"].add(bound)
                 elif alias.name == "environ":
-                    self._environ_aliases.add(bound)
+                    self.scopes[-1]["environ"].add(bound)
         self.generic_visit(node)
 
     # ------------------------------------------------------------------- calls
@@ -130,10 +188,10 @@ class _EnvVisitor(ast.NodeVisitor):
         func = node.func
         # os.getenv(...)
         if isinstance(func, ast.Attribute) and func.attr == "getenv":
-            return isinstance(func.value, ast.Name) and func.value.id in self._os_aliases
+            return isinstance(func.value, ast.Name) and func.value.id in self._all_aliases("os")
         # getenv(...) via `from os import getenv`
         if isinstance(func, ast.Name):
-            return func.id in self._getenv_aliases
+            return func.id in self._all_aliases("getenv")
         return False
 
     def _is_environ_get_call(self, node: ast.Call) -> bool:
@@ -143,9 +201,9 @@ class _EnvVisitor(ast.NodeVisitor):
         inner = func.value
         # os.environ.get(...)
         if isinstance(inner, ast.Attribute) and inner.attr == "environ":
-            return isinstance(inner.value, ast.Name) and inner.value.id in self._os_aliases
+            return isinstance(inner.value, ast.Name) and inner.value.id in self._all_aliases("os")
         # environ.get(...) via `from os import environ`
-        if isinstance(inner, ast.Name) and inner.id in self._environ_aliases:
+        if isinstance(inner, ast.Name) and inner.id in self._all_aliases("environ"):
             return True
         return False
 
@@ -153,9 +211,9 @@ class _EnvVisitor(ast.NodeVisitor):
         value = node.value
         # os.environ["X"]
         if isinstance(value, ast.Attribute) and value.attr == "environ":
-            return isinstance(value.value, ast.Name) and value.value.id in self._os_aliases
+            return isinstance(value.value, ast.Name) and value.value.id in self._all_aliases("os")
         # environ["X"] via `from os import environ`
-        if isinstance(value, ast.Name) and value.id in self._environ_aliases:
+        if isinstance(value, ast.Name) and value.id in self._all_aliases("environ"):
             return True
         return False
 
@@ -165,7 +223,18 @@ class _EnvVisitor(ast.NodeVisitor):
         if not node.args:
             return
         name_arg = node.args[0]
-        has_default = len(node.args) >= 2 or bool(node.keywords)
+
+        # find default arg — could be positional (args[1]) or keyword (default=...)
+        default_node: Optional[ast.AST] = None
+        if len(node.args) >= 2:
+            default_node = node.args[1]
+        else:
+            for kw in node.keywords:
+                if kw.arg == "default":
+                    default_node = kw.value
+                    break
+
+        has_default = default_node is not None or bool(node.keywords)
         name = _extract_string(name_arg)
         self.usages.append(
             EnvUsage(
@@ -175,6 +244,7 @@ class _EnvVisitor(ast.NodeVisitor):
                 has_default=has_default,
                 call_type=call_type,
                 raw_expr=None if name is not None else _unparse(name_arg),
+                default_node=default_node,
             )
         )
 
@@ -231,8 +301,18 @@ def _unparse(node: Optional[ast.AST]) -> str:
 
 
 def scan_file(path: Path) -> List[EnvUsage]:
+    # bail out early on huge files — typically vendored libs or minified output
+    # 2MB is generous for a real source file
     try:
-        source = path.read_text(encoding="utf-8")
+        if path.stat().st_size > MAX_FILE_SIZE:
+            raise ScanError(f"skipped {path}: file is larger than {MAX_FILE_SIZE} bytes")
+    except OSError as exc:
+        raise ScanError(f"could not stat {path}: {exc}") from exc
+
+    try:
+        # utf-8-sig handles files saved with BOM (Notepad does this by default
+        # on Windows). Plain utf-8 files still read fine since utf-8-sig is a superset.
+        source = path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError) as exc:
         raise ScanError(f"could not read {path}: {exc}") from exc
     try:
@@ -258,8 +338,7 @@ DEFAULT_EXCLUDES = frozenset({
 
 DEFAULT_EXTENSIONS = frozenset({".py"})
 
-# TODO: warn on files above this size, probably not worth scanning test fixtures
-MAX_FILE_SIZE = 2 * 1024 * 1024
+MAX_FILE_SIZE = 2 * 1024 * 1024  # 2MB
 
 
 def iter_python_files(
@@ -283,7 +362,15 @@ def iter_python_files(
         return files
 
     for path in root.rglob("*"):
-        if any(part in excludes for part in path.parts):
+        # check parts relative to root, not absolute — otherwise a project sitting
+        # inside ~/.venv/foo/ skips itself because '.venv' is in path.parts
+        try:
+            rel_parts = path.relative_to(root).parts
+        except ValueError:
+            # shouldn't normally happen since path comes from root.rglob, but
+            # symlinks pointing outside the tree can do this
+            rel_parts = path.parts
+        if any(part in excludes for part in rel_parts):
             continue
         if path.is_file() and path.suffix in exts:
             files.append(path)

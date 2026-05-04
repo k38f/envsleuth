@@ -356,3 +356,115 @@ def test_default_excludes_set_is_frozen() -> None:
     """Sanity check — make sure common dirs are excluded by default."""
     for expected in ["venv", ".venv", "__pycache__", "node_modules", ".git"]:
         assert expected in DEFAULT_EXCLUDES
+
+
+# ============================================================== regression tests
+
+
+def test_scan_works_when_root_path_contains_excluded_dir_name(tmp_path: Path) -> None:
+    # bug: project sitting under ~/.venv/foo skipped itself because '.venv' is
+    # in path.parts. now we only check parts relative to root.
+    project = tmp_path / ".venv" / "myproj"
+    write(project, "main.py", "import os\nos.getenv('NESTED')\n")
+    result = scan_project(project)
+    assert result.static_names == {"NESTED"}
+
+
+def test_scan_still_excludes_nested_excluded_dirs(tmp_path: Path) -> None:
+    # make sure the relative-parts fix didn't break the original behavior
+    write(tmp_path, "good.py", "import os\nos.getenv('GOOD')\n")
+    write(tmp_path, "venv/bad.py", "import os\nos.getenv('BAD')\n")
+    result = scan_project(tmp_path)
+    assert result.static_names == {"GOOD"}
+
+
+def test_utf8_bom_is_handled(tmp_path: Path) -> None:
+    # Windows Notepad saves utf-8 with BOM by default. before the fix this
+    # raised SyntaxError on the U+FEFF character.
+    p = tmp_path / "bom.py"
+    p.write_bytes(b"\xef\xbb\xbfimport os\nos.getenv('FROM_BOM')\n")
+    usages = scan_file(p)
+    assert len(usages) == 1
+    assert usages[0].name == "FROM_BOM"
+
+
+def test_oversized_file_is_skipped_with_error(tmp_path: Path) -> None:
+    # vendored libs and minified .py files can be huge — don't bother parsing.
+    # we report it as a scan error so the user knows we skipped it.
+    from envsleuth.scanner import MAX_FILE_SIZE
+    p = tmp_path / "huge.py"
+    # write something just over the limit. need real bytes, not just zeros
+    # because read might still work on sparse files
+    p.write_bytes(b"x = 1\n" * ((MAX_FILE_SIZE // 6) + 100))
+    result = scan_project(tmp_path)
+    assert result.usages == []
+    assert len(result.errors) == 1
+    assert "larger than" in result.errors[0][1]
+
+
+# ============================================================== scope handling
+
+
+def test_alias_in_function_doesnt_leak_outside(tmp_path: Path) -> None:
+    # before scope-awareness: ge from inside f() was treated as global,
+    # so a stray ge("OUTSIDE") would also be matched (it's actually NameError)
+    f = write(tmp_path, "a.py", """
+        def f():
+            from os import getenv as ge
+            ge("INSIDE")
+
+        ge("OUTSIDE")
+    """)
+    usages = scan_file(f)
+    names = {u.name for u in usages}
+    assert names == {"INSIDE"}
+
+
+def test_inner_function_sees_outer_import(tmp_path: Path) -> None:
+    # this is normal lexical scoping — inner can see outer
+    f = write(tmp_path, "a.py", """
+        import os
+
+        def outer():
+            def inner():
+                return os.getenv("STILL_VISIBLE")
+            return inner()
+    """)
+    usages = scan_file(f)
+    assert {u.name for u in usages} == {"STILL_VISIBLE"}
+
+
+def test_class_body_import_doesnt_leak_to_methods(tmp_path: Path) -> None:
+    # this would actually NameError at runtime — class body imports don't
+    # carry into methods. our scope handling now matches that.
+    f = write(tmp_path, "a.py", """
+        class Foo:
+            from os import getenv
+            X = getenv("CLASS_BODY")  # this works in class body
+
+            def method(self):
+                return getenv("BROKEN_AT_RUNTIME")  # NameError
+    """)
+    usages = scan_file(f)
+    names = {u.name for u in usages}
+    # CLASS_BODY is detected because class body sees the import.
+    # BROKEN_AT_RUNTIME is NOT detected because it's actually broken Python.
+    assert "CLASS_BODY" in names
+    assert "BROKEN_AT_RUNTIME" not in names
+
+
+def test_default_node_is_attached(tmp_path: Path) -> None:
+    # generator needs default_node to render literal defaults without re-parsing
+    f = write(tmp_path, "a.py", """
+        import os
+        os.getenv("PORT", "8000")
+        os.getenv("HOST", default="localhost")
+        os.getenv("NO_DEFAULT")
+    """)
+    usages = scan_file(f)
+    by_name = {u.name: u for u in usages}
+    assert by_name["PORT"].default_node is not None
+    assert by_name["HOST"].default_node is not None
+    assert by_name["NO_DEFAULT"].default_node is None
+    # and has_default still works for keyword form
+    assert by_name["HOST"].has_default is True
