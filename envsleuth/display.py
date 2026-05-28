@@ -182,7 +182,29 @@ def _render_summary(report: CheckReport, s: Styler) -> str:
 
     if not parts:
         return s.dim("No env vars found in code.")
-    return "  ".join(parts)
+
+    line = "  ".join(parts)
+
+    # only use the fancy box when colors are on. flashbar.panel() returns ANSI
+    # codes regardless of stdout state (their TTY autodetect lives in print_panel,
+    # not panel itself), so we'd otherwise leak escape codes into pipes and CI logs.
+    if not s.enabled:
+        return line
+
+    try:
+        from flashbar import panel
+        # pick a color based on whether there are issues
+        if n_missing:
+            color = "red"
+        elif n_default:
+            color = "yellow"
+        else:
+            color = "green"
+        return panel(line, title="Summary", color=color)
+    except Exception:
+        # if flashbar is missing or broken somehow, fall back to plain line.
+        # don't kill the whole report over fancy box drawing
+        return line
 
 
 # -------------------------------------------------------------------- errors
@@ -218,6 +240,91 @@ def render_env_not_found_error(
         lines.append(f"  {s.cyan('envsleuth scan --env path/to/.env')}")
 
     return "\n".join(lines)
+
+
+# ----------------------------------------------------------- github actions
+
+
+def render_report_github(report: CheckReport) -> str:
+    """Emit GitHub Actions workflow commands so missing vars show up as
+    annotations in the PR/run UI, right next to the source line.
+
+    Format docs: https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions
+    """
+    lines: List[str] = []
+
+    for var in report.missing:
+        # one annotation per usage so each occurrence gets pinned in the PR
+        for u in var.usages:
+            file_path = _gha_path(u.file)
+            msg = _gha_escape(
+                f"Missing env var: {var.name} is used here but not defined in "
+                f"{report.env_file.name if report.env_file else '.env'}"
+            )
+            lines.append(
+                f"::error file={file_path},line={u.line},"
+                f"title=Missing env var::{msg}"
+            )
+
+    # dynamic usages — warn, can't statically resolve so might be a bug
+    for u in report.dynamic_usages:
+        file_path = _gha_path(u.file)
+        expr = u.raw_expr or "?"
+        msg = _gha_escape(
+            f"Dynamic env var lookup: {u.call_type}({expr}). "
+            f"envsleuth can't check this statically."
+        )
+        lines.append(
+            f"::warning file={file_path},line={u.line},"
+            f"title=Dynamic env var::{msg}"
+        )
+
+    # scan errors get their own annotation too
+    for path, err in report.errors:
+        file_path = _gha_path(path)
+        msg = _gha_escape(f"Scan error: {err}")
+        lines.append(f"::error file={file_path},title=Scan error::{msg}")
+
+    # a final summary line so the run log isn't empty when everything is green
+    n_missing = len(report.missing)
+    n_dynamic = len(report.dynamic_usages)
+    n_errors = len(report.errors)
+    if n_missing == 0 and n_errors == 0:
+        if n_dynamic:
+            lines.append(f"::notice::envsleuth: all required vars defined "
+                         f"({n_dynamic} dynamic lookup{'s' if n_dynamic != 1 else ''} skipped)")
+        else:
+            lines.append("::notice::envsleuth: all required env vars defined")
+
+    return "\n".join(lines)
+
+
+def _gha_path(p: Path) -> str:
+    # GitHub Actions wants forward-slash paths relative to the repo root.
+    # inside a workflow run, GITHUB_WORKSPACE points exactly to the checkout —
+    # use it when available so paths line up with the PR diff even if the
+    # scanner was launched from a subdirectory.
+    workspace = os.environ.get("GITHUB_WORKSPACE")
+    if workspace:
+        try:
+            return p.relative_to(workspace).as_posix()
+        except ValueError:
+            pass
+    # local runs / non-GHA CI: fall back to cwd
+    try:
+        return p.relative_to(Path.cwd()).as_posix()
+    except ValueError:
+        return p.as_posix()
+
+
+def _gha_escape(text: str) -> str:
+    # workflow commands have a small set of chars that need percent-encoding
+    # see "Sending values to the post action" in the GHA docs
+    return (text.replace("%", "%25")
+                .replace("\r", "%0D")
+                .replace("\n", "%0A")
+                .replace(":", "%3A")
+                .replace(",", "%2C"))
 
 
 # ------------------------------------------------------------------- json out

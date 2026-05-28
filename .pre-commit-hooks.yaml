@@ -1,0 +1,32 @@
+# Hooks that consumers can add to their .pre-commit-config.yaml:
+#
+#   repos:
+#     - repo: https://github.com/k38f/envsleuth
+#       rev: v0.2.0
+#       hooks:
+#         - id: envsleuth
+#           # optional, override the default scan target
+#           # args: [--path, src, --env, .env, --strict]
+#
+# By default this runs `envsleuth scan --strict` so missing env vars fail
+# the commit. The hook only runs when .py files change — it doesn't trigger
+# on every commit.
+
+- id: envsleuth
+  name: envsleuth (check .env coverage)
+  description: Find env vars in Python code and check they're in .env
+  entry: envsleuth scan --strict
+  language: python
+  types: [python]
+  pass_filenames: false
+  # use ANSI when stdout is a tty (pre-commit usually pipes, so colors get stripped anyway)
+  stages: [pre-commit, manual]
+
+- id: envsleuth-generate
+  name: envsleuth generate (write .env.example)
+  description: Regenerate .env.example from code
+  entry: envsleuth generate --force
+  language: python
+  types: [python]
+  pass_filenames: false
+  stages: [manual]  # opt-in only, not run automatically

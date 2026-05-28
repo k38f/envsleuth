@@ -19,6 +19,7 @@ from envsleuth.checker import (
 from envsleuth.display import (
     render_env_not_found_error,
     render_report,
+    render_report_github,
     render_report_json,
     should_use_color,
 )
@@ -64,7 +65,15 @@ def cli() -> None:
 )
 @click.option(
     "--json", "as_json", is_flag=True,
-    help="Emit machine-readable JSON instead of the human report.",
+    help="Emit machine-readable JSON instead of the human report. "
+         "Equivalent to --output json.",
+)
+@click.option(
+    "--output", "-o", "output_format",
+    type=click.Choice(["text", "json", "github"], case_sensitive=False),
+    default=None,
+    help="Output format. 'github' emits GitHub Actions workflow commands so "
+         "missing vars show as PR annotations. Default: text.",
 )
 @click.option(
     "--no-color", is_flag=True,
@@ -82,18 +91,29 @@ def cli() -> None:
     "--verbose", "-v", is_flag=True,
     help="Show usage locations for every variable, not just missing ones.",
 )
+@click.option(
+    "--no-update-check", "no_update_check", is_flag=True,
+    help="Skip the weekly check for new envsleuth releases on PyPI.",
+)
 def scan(
     path: Path,
     env_file: Optional[Path],
     envignore: Optional[Path],
     strict: bool,
     as_json: bool,
+    output_format: Optional[str],
     no_color: bool,
     exclude: tuple,
     ext: tuple,
     verbose: bool,
+    no_update_check: bool,
 ) -> None:
     """Scan a project for env var usages and check against .env."""
+
+    # --json is an alias for --output json. if both given, --output wins
+    if output_format is None:
+        output_format = "json" if as_json else "text"
+    output_format = output_format.lower()
 
     # resolve paths up front so error messages look sensible
     root = path.resolve()
@@ -108,13 +128,13 @@ def scan(
         envignore = candidate if candidate.exists() else None
 
     use_color = should_use_color(force=False if no_color else None)
-    # --json means no color regardless
-    if as_json:
+    # machine-readable formats get no color
+    if output_format in ("json", "github"):
         use_color = False
 
-    # env file missing — bail out with a helpful message (unless JSON mode where
-    # we still want to emit a report for CI to consume)
-    if not env_file.exists() and not as_json:
+    # env file missing — bail out with a helpful message (unless machine format
+    # where we still want to emit a structured report for CI to consume)
+    if not env_file.exists() and output_format == "text":
         # look for .env* files in the same directory the user pointed at
         search_root = env_file.parent if env_file.parent.exists() else Path.cwd()
         nearby = find_nearby_env_files(search_root)
@@ -130,23 +150,15 @@ def scan(
 
     # flashbar progress, but only if the project is big enough to justify it
     files_preview = _count_files(root, exts, extra_excl)
-    use_progress = (not as_json) and files_preview >= PROGRESS_THRESHOLD and sys.stdout.isatty()
+    use_progress = (output_format == "text") and files_preview >= PROGRESS_THRESHOLD and sys.stdout.isatty()
 
     if use_progress:
         from flashbar import Bar  # imported lazily so --json path stays lean
-        bar = Bar(files_preview, label="Scanning", show_eta=True, show_speed=True)
-        def _tick(_f: Path) -> None:
-            bar.update()
-        try:
+        # context manager handles cleanup on exception too, no more getattr dance
+        with Bar(files_preview, label="Scanning", show_eta=True, show_speed=True) as bar:
+            def _tick(_f: Path) -> None:
+                bar.update()
             result = scan_project(root, extensions=exts, extra_excludes=extra_excl, on_file=_tick)
-        finally:
-            # flashbar's API name differs across versions, just try both
-            close = getattr(bar, "close", None) or getattr(bar, "finish", None)
-            if close:
-                try:
-                    close()
-                except Exception:
-                    pass  # don't let a broken progress bar kill the report
     else:
         result = scan_project(root, extensions=exts, extra_excludes=extra_excl)
 
@@ -155,10 +167,18 @@ def scan(
 
     report = check(result, env_file, ignore_patterns=patterns)
 
-    if as_json:
+    if output_format == "json":
         click.echo(render_report_json(report))
+    elif output_format == "github":
+        click.echo(render_report_github(report))
     else:
         click.echo(render_report(report, use_color=use_color, verbose=verbose))
+
+    # quietly check pypi for newer versions — never output in machine formats
+    # since it would corrupt the JSON or break the GHA annotation parser
+    if output_format == "text" and not no_update_check:
+        from envsleuth.update_check import maybe_notify
+        maybe_notify(__version__)
 
     if strict and report.has_issues:
         sys.exit(1)
@@ -186,9 +206,13 @@ def _count_files(root: Path, exts, excludes) -> int:
     help="Where to write the example file. Defaults to ./.env.example",
 )
 @click.option("--force", "-f", is_flag=True, help="Overwrite if output file exists.")
-@click.option("--no-color", is_flag=True)
-@click.option("--exclude", multiple=True)
-@click.option("--ext", multiple=True)
+@click.option("--no-color", is_flag=True, help="Disable ANSI colors in the success message.")
+@click.option("--exclude", multiple=True, help="Extra directory name to skip. Can be repeated.")
+@click.option("--ext", multiple=True, help="Extra file extension to scan (e.g. .pyi). Can be repeated.")
+@click.option(
+    "--no-update-check", "no_update_check", is_flag=True,
+    help="Skip the weekly check for new envsleuth releases on PyPI.",
+)
 def generate(
     path: Path,
     output: Optional[Path],
@@ -196,6 +220,7 @@ def generate(
     no_color: bool,
     exclude: tuple,
     ext: tuple,
+    no_update_check: bool,
 ) -> None:
     """Generate a .env.example file from scanned code."""
 
@@ -223,6 +248,10 @@ def generate(
     if use_color:
         msg = f"\033[32m✓\033[0m {msg}"
     click.echo(msg)
+
+    if not no_update_check:
+        from envsleuth.update_check import maybe_notify
+        maybe_notify(__version__)
 
 
 if __name__ == "__main__":

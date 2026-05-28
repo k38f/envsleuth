@@ -1,5 +1,9 @@
 # envsleuth
 
+🌐 **English** · [简体中文](README.zh-CN.md)
+
+*Parts of this README were translated and edited with AI.*
+
 [![tests](https://github.com/k38f/envsleuth/actions/workflows/tests.yml/badge.svg)](https://github.com/k38f/envsleuth/actions/workflows/tests.yml)
 [![pypi](https://img.shields.io/pypi/v/envsleuth.svg)](https://pypi.org/project/envsleuth/)
 [![python](https://img.shields.io/pypi/pyversions/envsleuth.svg)](https://pypi.org/project/envsleuth/)
@@ -87,6 +91,63 @@ c = sys_os.getenv("C")
 
 Variables with names computed at runtime (e.g. `os.getenv(f"PREFIX_{x}")`) can't be checked statically — they're reported in a separate warning section so you know they exist.
 
+### Django and config libraries (new in 0.2)
+
+envsleuth also understands the two most common third-party config patterns:
+
+```python
+# django-environ
+import environ
+env = environ.Env()
+SECRET_KEY = env('SECRET_KEY')
+DEBUG = env.bool('DEBUG', default=False)
+DATABASES = {'default': env.db('DATABASE_URL')}
+ALLOWED_HOSTS = env.list('ALLOWED_HOSTS', default=[])
+
+# python-decouple
+from decouple import config
+SECRET_KEY = config('SECRET_KEY')
+DEBUG = config('DEBUG', default=False, cast=bool)
+```
+
+All of `env('X')`, `env.bool('X')`, `env.int('X')`, `env.str('X')`,
+`env.list('X')`, `env.float('X')`, `env.db('X')`, `env.cache('X')`,
+`env.url('X')`, `env.path('X')`, `env.tuple('X')`, `env.dict('X')`,
+`env.json('X')`, `env.search_url('X')`, `env.email_url('X')` are detected.
+Aliased imports work too: `from decouple import config as cfg`.
+
+## CI: GitHub Actions annotations
+
+Get missing env vars surfaced as PR annotations on the exact source lines:
+
+```yaml
+# .github/workflows/env-check.yml
+- name: Check env vars
+  run: envsleuth scan --output github --strict
+```
+
+Each missing var becomes an `::error` annotation; dynamic lookups become
+`::warning`. The format follows GitHub's [workflow command
+spec](https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions).
+
+## pre-commit hook
+
+Add envsleuth to your `.pre-commit-config.yaml`:
+
+```yaml
+repos:
+  - repo: https://github.com/k38f/envsleuth
+    rev: v0.2.0
+    hooks:
+      - id: envsleuth
+        # optional overrides
+        # args: [--path, src, --env, .env]
+```
+
+Runs `envsleuth scan --strict` on every commit that touches Python files.
+There's also an opt-in `envsleuth-generate` hook for regenerating
+`.env.example` manually via `pre-commit run envsleuth-generate --hook-stage manual`.
+
 ## `envsleuth generate`
 
 Scans your code and writes a `.env.example` with every variable found, a comment pointing at where it's used, and the default value from code if there is one:
@@ -125,30 +186,6 @@ DEBUG_TOOL
 
 Great for vars that come from CI, Docker, or your shell rc files rather than the local `.env`.
 
-## CI usage
-
-GitHub Actions:
-
-```yaml
-- name: Check env vars
-  run: |
-    pip install envsleuth
-    envsleuth scan --env .env.example --strict
-```
-
-pre-commit:
-
-```yaml
-# .pre-commit-config.yaml
-- repo: local
-  hooks:
-    - id: envsleuth
-      name: envsleuth
-      entry: envsleuth scan --strict
-      language: system
-      pass_filenames: false
-```
-
 ## CLI reference
 
 ### `envsleuth scan`
@@ -159,11 +196,13 @@ pre-commit:
 | `--env` | Path to `.env` file. Default: `./.env` |
 | `--envignore` | Path to `.envignore`. Default: `./.envignore` if present |
 | `--strict` | Exit with code 1 if vars are missing |
-| `--json` | JSON output for CI pipelines |
+| `--output`, `-o` | `text` (default), `json`, or `github` (Actions annotations) |
+| `--json` | Alias for `--output json` (kept for backwards compat) |
 | `--no-color` | Disable ANSI colors (also honours `NO_COLOR` env var) |
 | `--exclude DIR` | Extra directory name to skip. Can be repeated |
 | `--ext .EXT` | Extra file extension to scan (e.g. `.pyi`). Can be repeated |
 | `--verbose`, `-v` | Show usage locations for every variable |
+| `--no-update-check` | Skip the weekly PyPI version check |
 
 ### `envsleuth generate`
 
@@ -174,6 +213,27 @@ pre-commit:
 | `--force`, `-f` | Overwrite existing output file |
 | `--no-color` | Disable ANSI colors in the success message |
 | `--exclude`, `--ext` | Same as in `scan` |
+| `--no-update-check` | Skip the weekly PyPI version check |
+
+## Update notifications
+
+envsleuth checks PyPI for new releases at most once per week. When a new version is available, it prints a single line to stderr:
+
+```
+ℹ  envsleuth 0.2.0 is available (you have 0.1.1). Run: pip install -U envsleuth
+```
+
+The check is cached, runs with a short timeout, and stays silent on any error (offline, blocked network, etc). To disable it entirely:
+
+```bash
+# per-command
+envsleuth scan --no-update-check
+
+# globally for your shell
+export ENVSLEUTH_NO_UPDATE_CHECK=1
+```
+
+The cache lives at `~/.cache/envsleuth/last_check.json` (or `$XDG_CACHE_HOME/envsleuth/...`).
 
 ## How it compares
 

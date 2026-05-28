@@ -468,3 +468,184 @@ def test_default_node_is_attached(tmp_path: Path) -> None:
     assert by_name["NO_DEFAULT"].default_node is None
     # and has_default still works for keyword form
     assert by_name["HOST"].has_default is True
+
+
+# ============================================================== django-environ
+
+
+def test_django_environ_basic(tmp_path: Path) -> None:
+    f = write(tmp_path, "settings.py", """
+        import environ
+        env = environ.Env()
+        SECRET = env('SECRET_KEY')
+        DEBUG = env.bool('DEBUG', default=False)
+        PORT = env.int('PORT', default=8000)
+        HOSTS = env.list('ALLOWED_HOSTS', default=[])
+    """)
+    usages = scan_file(f)
+    names = {u.name for u in usages}
+    assert names == {"SECRET_KEY", "DEBUG", "PORT", "ALLOWED_HOSTS"}
+
+    by_name = {u.name: u for u in usages}
+    assert by_name["SECRET_KEY"].call_type == "django_environ"
+    assert by_name["DEBUG"].call_type == "django_environ.bool"
+    assert by_name["PORT"].call_type == "django_environ.int"
+    assert by_name["HOSTS" if "HOSTS" in by_name else "ALLOWED_HOSTS"].call_type == "django_environ.list"
+
+
+def test_django_environ_db_helpers(tmp_path: Path) -> None:
+    # env.db() / env.cache() / env.url() also take a var name as first arg
+    f = write(tmp_path, "settings.py", """
+        import environ
+        env = environ.Env()
+        DATABASES = {'default': env.db('DATABASE_URL')}
+        CACHES = {'default': env.cache('REDIS_URL')}
+    """)
+    usages = scan_file(f)
+    assert {u.name for u in usages} == {"DATABASE_URL", "REDIS_URL"}
+
+
+def test_django_environ_aliased_module(tmp_path: Path) -> None:
+    # `import environ as envlib` is unusual but valid
+    f = write(tmp_path, "settings.py", """
+        import environ as envlib
+        env = envlib.Env()
+        x = env('X')
+    """)
+    usages = scan_file(f)
+    assert {u.name for u in usages} == {"X"}
+
+
+def test_django_environ_multiple_instances(tmp_path: Path) -> None:
+    # some projects use separate Env instances for different scopes
+    f = write(tmp_path, "settings.py", """
+        import environ
+        env = environ.Env()
+        env_dev = environ.Env()
+        A = env('FROM_MAIN')
+        B = env_dev('FROM_DEV')
+    """)
+    usages = scan_file(f)
+    assert {u.name for u in usages} == {"FROM_MAIN", "FROM_DEV"}
+
+
+def test_django_environ_only_tracked_after_assignment(tmp_path: Path) -> None:
+    # without `env = environ.Env(...)`, a bare env(...) call shouldn't match
+    f = write(tmp_path, "a.py", """
+        import environ
+        # never assigns environ.Env(), just imports — this env() is something else
+        env = lambda x: x
+        env('NOT_AN_ENV_VAR')
+    """)
+    usages = scan_file(f)
+    assert usages == []  # `env` is not an Env instance
+
+
+# ============================================================== python-decouple
+
+
+def test_decouple_basic(tmp_path: Path) -> None:
+    f = write(tmp_path, "conf.py", """
+        from decouple import config, Csv
+        SECRET = config('SECRET_KEY')
+        DEBUG = config('DEBUG', default=False, cast=bool)
+        HOSTS = config('ALLOWED_HOSTS', cast=Csv())
+    """)
+    usages = scan_file(f)
+    names = {u.name for u in usages}
+    assert names == {"SECRET_KEY", "DEBUG", "ALLOWED_HOSTS"}
+    for u in usages:
+        assert u.call_type == "decouple_config"
+
+
+def test_decouple_aliased(tmp_path: Path) -> None:
+    f = write(tmp_path, "conf.py", """
+        from decouple import config as cfg
+        KEY = cfg('SECRET_KEY')
+    """)
+    usages = scan_file(f)
+    assert [u.name for u in usages] == ["SECRET_KEY"]
+
+
+def test_decouple_default_extraction(tmp_path: Path) -> None:
+    # default= keyword should be picked up just like os.getenv
+    f = write(tmp_path, "a.py", """
+        from decouple import config
+        config('PORT', default='8000')
+    """)
+    usages = scan_file(f)
+    assert usages[0].has_default is True
+    assert usages[0].default_node is not None
+
+
+def test_decouple_scoped_to_function(tmp_path: Path) -> None:
+    # alias from inside a function shouldn't leak — same scope rules as os imports
+    f = write(tmp_path, "a.py", """
+        def f():
+            from decouple import config
+            config('INSIDE')
+
+        config('OUTSIDE')  # NameError in real python
+    """)
+    usages = scan_file(f)
+    assert [u.name for u in usages] == ["INSIDE"]
+
+
+# ============================================================== v0.2 regressions
+
+
+def test_has_default_only_true_for_actual_default_kw(tmp_path: Path) -> None:
+    # critical bug fix: any keyword arg used to set has_default=True. now we
+    # check that only `default=` (or args[1]) counts. cast=, subcast=, etc. don't.
+    f = write(tmp_path, "a.py", """
+        from decouple import config
+        config('R', cast=bool)
+        config('H', default='x', cast=bool)
+        config('P', 'x')
+        config('N')
+    """)
+    by_name = {u.name: u for u in scan_file(f)}
+    assert by_name["R"].has_default is False, "cast=bool alone is NOT a default"
+    assert by_name["H"].has_default is True
+    assert by_name["P"].has_default is True  # positional default still works
+    assert by_name["N"].has_default is False
+
+
+def test_has_default_for_django_env_methods(tmp_path: Path) -> None:
+    # same bug applies to env.list('X', subcast=str) — REQUIRED, no default
+    f = write(tmp_path, "a.py", """
+        import environ
+        env = environ.Env()
+        REQUIRED = env.list('R', subcast=str)
+        WITH_DEFAULT = env.list('W', default=[])
+    """)
+    by_name = {u.name: u for u in scan_file(f)}
+    assert by_name["R"].has_default is False
+    assert by_name["W"].has_default is True
+
+
+def test_django_environ_from_environ_import_env(tmp_path: Path) -> None:
+    # bug fix: `from environ import Env; env = Env(...)` is a documented pattern
+    # in django-environ tutorials. used to return zero usages.
+    f = write(tmp_path, "settings.py", """
+        from environ import Env
+        env = Env()
+        SECRET = env('SECRET_KEY')
+        DEBUG = env.bool('DEBUG', default=False)
+    """)
+    usages = scan_file(f)
+    names = {u.name for u in usages}
+    assert names == {"SECRET_KEY", "DEBUG"}
+
+
+def test_django_environ_from_environ_with_alias(tmp_path: Path) -> None:
+    f = write(tmp_path, "a.py", """
+        from environ import Env as Env_
+        env = Env_()
+        X = env('X')
+    """)
+    usages = scan_file(f)
+    assert {u.name for u in usages} == {"X"}
+
+
+# ============================================================== mixed

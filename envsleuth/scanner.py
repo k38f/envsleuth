@@ -1,6 +1,8 @@
 """AST-based scanner for environment variable usages in Python code.
 
-Detects three patterns:
+Detects the following patterns:
+
+    # stdlib
     os.getenv("VAR")              -> static usage
     os.getenv("VAR", "default")   -> static usage with default
     os.environ["VAR"]             -> static usage
@@ -9,10 +11,27 @@ Detects three patterns:
     os.getenv(var_name)           -> dynamic usage (can't resolve)
     os.getenv(f"PREFIX_{x}")      -> dynamic usage (can't resolve)
 
+    # django-environ
+    import environ
+    env = environ.Env(...)
+    env("DEBUG")                  -> static usage
+    env.bool("DEBUG", default=False)
+    env.int("PORT", default=8000)
+    env.list("ALLOWED_HOSTS", default=[])
+    env.db("DATABASE_URL")
+    # plus: str, float, tuple, dict, json, cache, url, path, search_url, email_url
+
+    # python-decouple
+    from decouple import config
+    config("SECRET_KEY")          -> static usage
+    config("DEBUG", default=False, cast=bool)
+
 The scanner also tracks aliased imports:
     from os import getenv; getenv("X")            -> detected
     from os import environ; environ["X"]          -> detected
     import os as operating_system                  -> detected
+    from decouple import config as cfg            -> detected
+    env_dev = environ.Env(...)                     -> detected
 """
 
 from __future__ import annotations
@@ -40,7 +59,13 @@ class EnvUsage:
     """True if a default value was provided (e.g. os.getenv('X', 'fallback'))."""
 
     call_type: str = "getenv"
-    """One of: 'getenv', 'environ_subscript', 'environ_get'."""
+    """How the env var was looked up. One of:
+        'getenv', 'environ_subscript', 'environ_get',
+        'decouple_config',
+        'django_environ', 'django_environ.bool', 'django_environ.int',
+        'django_environ.str', 'django_environ.list', 'django_environ.db',
+        'django_environ.cache', etc.
+    """
 
     raw_expr: Optional[str] = None
     """For dynamic usages: text of the unresolved expression (for diagnostics)."""
@@ -81,6 +106,15 @@ class ScanError(Exception):
     """Raised when a single file cannot be scanned."""
 
 
+# django-environ exposes a bunch of typed accessors. all of them take the var
+# name as the first positional arg, same shape as os.getenv, so we can reuse
+# the same recording path.
+_DJANGO_ENVIRON_METHODS = frozenset({
+    "bool", "int", "str", "list", "float", "tuple", "dict", "json",
+    "db", "cache", "url", "path", "search_url", "email_url",
+})
+
+
 class _EnvVisitor(ast.NodeVisitor):
     """AST visitor that collects env var usages from a single module."""
 
@@ -97,7 +131,22 @@ class _EnvVisitor(ast.NodeVisitor):
 
     @staticmethod
     def _fresh_scope(kind: str) -> dict:
-        return {"kind": kind, "os": set(), "getenv": set(), "environ": set()}
+        return {
+            "kind": kind,
+            "os": set(),
+            "getenv": set(),
+            "environ": set(),
+            # django-environ: name of the module ('environ' or its alias),
+            # used to spot `env = environ.Env(...)` assignments
+            "django_environ_mod": set(),
+            # the Env class itself when imported directly, e.g.
+            # `from environ import Env` then `env = Env(...)` (also a documented pattern)
+            "environ_env_class": set(),
+            # instance vars bound to environ.Env(...) — `env`, `env_dev`, etc.
+            "environ_env": set(),
+            # names bound to decouple.config (e.g. `from decouple import config as cfg` → {'cfg'})
+            "decouple_config": set(),
+        }
 
     def _push_scope(self, kind: str) -> None:
         self.scopes.append(self._fresh_scope(kind))
@@ -155,6 +204,10 @@ class _EnvVisitor(ast.NodeVisitor):
         for alias in node.names:
             if alias.name == "os":
                 self.scopes[-1]["os"].add(alias.asname or "os")
+            elif alias.name == "environ":
+                # `import environ` — the django-environ package. need this to
+                # later spot `env = environ.Env(...)` calls
+                self.scopes[-1]["django_environ_mod"].add(alias.asname or "environ")
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
@@ -165,7 +218,45 @@ class _EnvVisitor(ast.NodeVisitor):
                     self.scopes[-1]["getenv"].add(bound)
                 elif alias.name == "environ":
                     self.scopes[-1]["environ"].add(bound)
+        elif node.module == "decouple":
+            # `from decouple import config` or `from decouple import config as cfg`
+            for alias in node.names:
+                if alias.name == "config":
+                    self.scopes[-1]["decouple_config"].add(alias.asname or "config")
+        elif node.module == "environ":
+            # `from environ import Env` — also valid, then `env = Env(...)` later.
+            # rare but documented in django-environ tutorials
+            for alias in node.names:
+                if alias.name == "Env":
+                    self.scopes[-1]["environ_env_class"].add(alias.asname or "Env")
         self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        # detect `env = environ.Env(...)` and remember `env` as an Env instance
+        self._track_environ_assignment(node)
+        self.generic_visit(node)
+
+    def _track_environ_assignment(self, node: ast.Assign) -> None:
+        if not isinstance(node.value, ast.Call):
+            return
+        func = node.value.func
+
+        is_env_call = False
+        # case 1: `env = environ.Env(...)` — attribute call on the module
+        if isinstance(func, ast.Attribute) and func.attr == "Env":
+            if isinstance(func.value, ast.Name) and func.value.id in self._all_aliases("django_environ_mod"):
+                is_env_call = True
+        # case 2: `env = Env(...)` — direct call after `from environ import Env`
+        elif isinstance(func, ast.Name):
+            if func.id in self._all_aliases("environ_env_class"):
+                is_env_call = True
+
+        if not is_env_call:
+            return
+        # bind every Name target on the LHS
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                self.scopes[-1]["environ_env"].add(target.id)
 
     # ------------------------------------------------------------------- calls
 
@@ -175,6 +266,13 @@ class _EnvVisitor(ast.NodeVisitor):
             self._record_call(node, call_type="getenv")
         elif self._is_environ_get_call(node):
             self._record_call(node, call_type="environ_get")
+        else:
+            # django-environ / decouple — check both, only one will match
+            dje_kind = self._django_environ_kind(node)
+            if dje_kind is not None:
+                self._record_call(node, call_type=dje_kind)
+            elif self._is_decouple_config_call(node):
+                self._record_call(node, call_type="decouple_config")
         self.generic_visit(node)
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
@@ -217,6 +315,31 @@ class _EnvVisitor(ast.NodeVisitor):
             return True
         return False
 
+    def _django_environ_kind(self, node: ast.Call) -> Optional[str]:
+        """If this is a django-environ env(...) or env.method(...) call, return
+        a call_type string like 'django_environ' or 'django_environ.bool'.
+        Otherwise return None.
+        """
+        instances = self._all_aliases("environ_env")
+        if not instances:
+            return None
+        func = node.func
+        # env('NAME', ...) — direct call on the Env instance
+        if isinstance(func, ast.Name) and func.id in instances:
+            return "django_environ"
+        # env.bool('NAME', ...), env.int('NAME', ...), env.db('NAME'), etc.
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            if func.value.id in instances and func.attr in _DJANGO_ENVIRON_METHODS:
+                return f"django_environ.{func.attr}"
+        return None
+
+    def _is_decouple_config_call(self, node: ast.Call) -> bool:
+        # `config('NAME')` or `cfg('NAME')` after `from decouple import config [as cfg]`
+        func = node.func
+        if isinstance(func, ast.Name) and func.id in self._all_aliases("decouple_config"):
+            return True
+        return False
+
     # ----------------------------------------------------------------- recording
 
     def _record_call(self, node: ast.Call, call_type: str) -> None:
@@ -234,7 +357,11 @@ class _EnvVisitor(ast.NodeVisitor):
                     default_node = kw.value
                     break
 
-        has_default = default_node is not None or bool(node.keywords)
+        # only count it as "has default" if we actually found a default value.
+        # was: `default_node is not None or bool(node.keywords)` — that flagged
+        # `config('X', cast=bool)` as defaulted even though it isn't, which then
+        # silently passed --strict mode on missing required vars.
+        has_default = default_node is not None
         name = _extract_string(name_arg)
         self.usages.append(
             EnvUsage(
