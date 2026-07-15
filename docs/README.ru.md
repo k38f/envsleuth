@@ -107,11 +107,13 @@ SECRET_KEY = config('SECRET_KEY')
 DEBUG = config('DEBUG', default=False, cast=bool)
 ```
 
-Распознаются `env('X')`, `env.bool('X')`, `env.int('X')`, `env.str('X')`,
-`env.list('X')`, `env.float('X')`, `env.db('X')`, `env.cache('X')`,
-`env.url('X')`, `env.path('X')`, `env.tuple('X')`, `env.dict('X')`,
-`env.json('X')`, `env.search_url('X')`, `env.email_url('X')`.
-Импорты с псевдонимами тоже работают: `from decouple import config as cfg`.
+Распознаются обращения через `env(...)`, `env.get_value(...)` и типизированные
+методы: `str`, `bytes`, `bool`, `int`, `float`, `json`, `list`, `tuple`, `dict`,
+`url`, `db_url`/`db`, `cache_url`/`cache`, `email_url`/`email`, `search_url`,
+`channels_url`/`channels` и `path`. Также поддерживаются `FileAwareEnv` и
+`Env.configured(...)`, включая значения по умолчанию из их схем и статически
+известные настройки `env.prefix`. Импорты с псевдонимами тоже работают:
+`from decouple import config as cfg`.
 
 ## CI: аннотации GitHub Actions
 
@@ -132,14 +134,17 @@ DEBUG = config('DEBUG', default=False, cast=bool)
 ```yaml
 repos:
   - repo: https://github.com/k38f/envsleuth
-    rev: v0.2.0
+    rev: v0.3.0
     hooks:
       - id: envsleuth
         # необязательные переопределения
         # args: [--path, src, --env, .env]
 ```
 
-`envsleuth scan --strict` запускается при каждом коммите, затрагивающем Python-файлы. Дополнительный hook `envsleuth-generate` можно запустить вручную для пересоздания `.env.example`: `pre-commit run envsleuth-generate --hook-stage manual`.
+`envsleuth scan --strict` запускается при изменении Python-файлов, `.env`,
+`.env.*` или `.envignore`. Дополнительный hook `envsleuth-generate` можно
+запустить вручную для пересоздания `.env.example`:
+`pre-commit run envsleuth-generate --hook-stage manual`.
 
 ## `envsleuth generate`
 
@@ -165,6 +170,17 @@ DEBUG=false
 ```
 
 `--force` перезаписывает существующий файл, а `--output path/to/file` указывает другое место записи.
+
+Генерация работает по принципу fail-closed: если какой-либо исходный файл не
+удалось просканировать или имя переменной нельзя записать как переносимое
+присваивание окружения, команда завершается с кодом 2 и не создаёт и не
+перезаписывает целевой файл даже с `--force`. Динамические обращения сохраняются
+в предупреждающих комментариях. Литеральное значение по умолчанию записывается,
+только если оно одинаково читается `python-dotenv` и POSIX shell; иначе значение
+остаётся пустым с пометкой `# default omitted`.
+В Windows генерация также отклоняет имена, отличающиеся только регистром
+(например, `FOO` и `foo`), потому что окружение Windows не может хранить их
+раздельно.
 
 ## `.envignore`
 
@@ -208,12 +224,21 @@ DEBUG_TOOL
 | `--exclude`, `--ext` | То же, что в `scan` |
 | `--no-update-check` | Пропустить еженедельную проверку версии на PyPI |
 
+### Коды выхода
+
+- `0` — команда выполнена успешно.
+- `1` — `scan --strict` нашёл обязательные переменные, которых нет в существующем `.env`.
+- `2` — операционная ошибка: например, отсутствует `.env`, сканирование
+  завершилось не полностью, указан неверный путь или произошла ошибка
+  чтения, записи либо генерации. JSON-режим и вывод для GitHub по возможности
+  сначала возвращают структурированный отчёт об ошибке.
+
 ## Уведомления об обновлениях
 
 envsleuth не чаще раза в неделю проверяет наличие новых выпусков на PyPI. Если новая версия есть, в stderr выводится одна строка:
 
 ```
-ℹ  envsleuth 0.2.0 is available (you have 0.1.1). Run: pip install -U envsleuth
+ℹ  envsleuth 0.3.0 is available (you have 0.2.0). Run: pip install -U envsleuth
 ```
 
 Результат кэшируется, запрос имеет короткий тайм-аут, а при любой ошибке (нет сети, доступ заблокирован и т. д.) проверка молча завершается. Чтобы полностью её отключить:
@@ -246,6 +271,7 @@ dotenv-linter проверяет `.env`, а python-decouple читает кон�
 - [click](https://click.palletsprojects.com/) — CLI
 - [python-dotenv](https://github.com/theskumar/python-dotenv) — разбор `.env`
 - [flashbar](https://github.com/k38f/flashbar) — индикатор прогресса при сканировании 20+ файлов
+- [packaging](https://packaging.pypa.io/) — сравнение версий по PEP 440 при проверке обновлений
 
 Сам сканер использует только стандартную библиотеку Python (`ast`).
 

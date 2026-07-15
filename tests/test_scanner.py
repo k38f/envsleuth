@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import sys
 import textwrap
 from pathlib import Path
 
@@ -314,6 +316,21 @@ def test_scan_project_excludes_default_dirs(tmp_path: Path) -> None:
     write(tmp_path, "__pycache__/bad.py", "import os\nos.getenv('BAD4')\n")
 
     result = scan_project(tmp_path)
+    assert result.static_names == {"GOOD"}
+
+
+def test_scan_project_excludes_virtualenv_with_a_custom_name(
+    tmp_path: Path,
+) -> None:
+    write(tmp_path, "good.py", "import os\nos.getenv('GOOD')\n")
+    write(tmp_path, "runtime/pyvenv.cfg", "home = /usr/bin\n")
+    write(
+        tmp_path, "runtime/lib/site-packages/dependency.py",
+        "import os\nos.getenv('FROM_DEPENDENCY')\n",
+    )
+
+    result = scan_project(tmp_path)
+
     assert result.static_names == {"GOOD"}
 
 
@@ -646,6 +663,699 @@ def test_django_environ_from_environ_with_alias(tmp_path: Path) -> None:
     """)
     usages = scan_file(f)
     assert {u.name for u in usages} == {"X"}
+
+
+# ======================================================== scanner bugcheck
+
+
+def test_environ_writes_and_deletes_are_not_reads(tmp_path: Path) -> None:
+    f = write(tmp_path, "writes.py", """
+        import os
+
+        os.environ["WRITE_ONLY"] = "value"
+        del os.environ["DELETE_ONLY"]
+        os.environ["READ_AND_WRITE"] += "suffix"
+        value = os.environ["READ_ONLY"]
+    """)
+
+    usages = scan_file(f)
+    assert [usage.name for usage in usages] == ["READ_AND_WRITE", "READ_ONLY"]
+
+
+def test_keyword_variable_names_are_supported(tmp_path: Path) -> None:
+    f = write(tmp_path, "keywords.py", """
+        import os
+        import environ
+        from os import getenv as ge
+        from decouple import config
+
+        env = environ.Env()
+        os.getenv(key="OS_KEY")
+        os.environ.get(key="MAPPING_KEY", default="fallback")
+        ge(key="ALIASED_KEY")
+        config(option="DECOUPLE_OPTION", default="x")
+        env(var="DJANGO_VAR", cast=int)
+        env.bool(var="DJANGO_BOOL", default=False)
+    """)
+
+    by_name = {usage.name: usage for usage in scan_file(f)}
+    assert set(by_name) == {
+        "OS_KEY", "MAPPING_KEY", "ALIASED_KEY", "DECOUPLE_OPTION",
+        "DJANGO_VAR", "DJANGO_BOOL",
+    }
+    assert by_name["DJANGO_VAR"].has_default is False
+    assert by_name["DJANGO_BOOL"].has_default is True
+
+
+def test_django_positional_default_signatures(tmp_path: Path) -> None:
+    f = write(tmp_path, "django_args.py", """
+        import environ
+
+        env = environ.Env()
+        env("CALL_CAST", int)
+        env("CALL_DEFAULT", int, 8000)
+        env.list("LIST_CAST", str)
+        env.list("LIST_DEFAULT", str, [])
+        env.dict("DICT_CAST", dict)
+        env.bool("BOOL_DEFAULT", False)
+    """)
+
+    by_name = {usage.name: usage for usage in scan_file(f)}
+    assert by_name["CALL_CAST"].has_default is False
+    assert by_name["CALL_DEFAULT"].has_default is True
+    assert by_name["LIST_CAST"].has_default is False
+    assert by_name["LIST_DEFAULT"].has_default is True
+    assert by_name["DICT_CAST"].has_default is False
+    assert by_name["BOOL_DEFAULT"].has_default is True
+
+
+def test_aliases_stop_matching_after_shadow_or_rebind(tmp_path: Path) -> None:
+    f = write(tmp_path, "shadowing.py", """
+        import os
+
+        os.getenv("BEFORE_REBIND")
+        os = object()
+        os.getenv("AFTER_REBIND")
+
+        def takes_os(os):
+            return os.getenv("PARAMETER")
+    """)
+
+    assert [usage.name for usage in scan_file(f)] == ["BEFORE_REBIND"]
+
+
+def test_alias_assignment_lambda_and_comprehension_scopes(tmp_path: Path) -> None:
+    f = write(tmp_path, "nested_scopes.py", """
+        import os
+
+        operating_system = os
+        operating_system.getenv("PROPAGATED")
+        fn = lambda os: os.getenv("LAMBDA_PARAMETER")
+        hidden = [os.getenv("COMP_TARGET") for os in values]
+        visible = [os.getenv("COMP_VISIBLE") for item in values]
+        source = [item for os in [os.getenv("FIRST_ITERABLE")]]
+    """)
+
+    assert {usage.name for usage in scan_file(f)} == {
+        "PROPAGATED", "COMP_VISIBLE", "FIRST_ITERABLE",
+    }
+
+
+def test_function_decorators_and_defaults_use_enclosing_scope(tmp_path: Path) -> None:
+    f = write(tmp_path, "definition_time.py", """
+        import os
+
+        @decorate(os.getenv("DECORATOR_VALUE"))
+        def configured(value=os.getenv("ARG_DEFAULT"), os=None):
+            return os.getenv("PARAM_SHADOW")
+    """)
+
+    assert [usage.name for usage in scan_file(f)] == [
+        "DECORATOR_VALUE", "ARG_DEFAULT",
+    ]
+
+
+def test_relative_os_import_is_not_stdlib(tmp_path: Path) -> None:
+    f = write(tmp_path, "relative.py", """
+        from .os import getenv, environ
+
+        getenv("LOCAL_GETENV")
+        environ["LOCAL_ENVIRON"]
+    """)
+
+    assert scan_file(f) == []
+
+
+def test_annotated_django_instances_and_schema_defaults(tmp_path: Path) -> None:
+    f = write(tmp_path, "schema.py", """
+        import environ
+
+        env: environ.Env = environ.Env(
+            DEBUG=(bool, False),
+            OPTIONAL=(str, None),
+            REQUIRED=str,
+        )
+        alias: environ.Env = env
+        alias("DEBUG")
+        alias("OPTIONAL")
+        alias("REQUIRED")
+    """)
+
+    by_name = {usage.name: usage for usage in scan_file(f)}
+    assert by_name["DEBUG"].has_default is True
+    assert ast.literal_eval(by_name["DEBUG"].default_node) is False
+    assert by_name["OPTIONAL"].has_default is True
+    assert ast.literal_eval(by_name["OPTIONAL"].default_node) is None
+    assert by_name["REQUIRED"].has_default is False
+
+
+def test_file_aware_env_and_current_helper_methods(tmp_path: Path) -> None:
+    f = write(tmp_path, "file_aware.py", """
+        import environ
+        from environ import FileAwareEnv as SecretEnv
+
+        env = environ.FileAwareEnv()
+        other = SecretEnv()
+        env("SECRET_KEY")
+        other.bytes("CERTIFICATE")
+        env.db()
+        env.cache_url()
+        env.email()
+        env.channels()
+        env.get_value("CAST_ONLY", str)
+        env.get_value("WITH_DEFAULT", str, "fallback")
+    """)
+
+    by_name = {usage.name: usage for usage in scan_file(f)}
+    assert set(by_name) == {
+        "SECRET_KEY", "CERTIFICATE", "DATABASE_URL", "CACHE_URL",
+        "EMAIL_URL", "CHANNELS_URL", "CAST_ONLY", "WITH_DEFAULT",
+    }
+    assert by_name["CAST_ONLY"].has_default is False
+    assert by_name["WITH_DEFAULT"].has_default is True
+
+
+def test_configured_env_scheme_is_propagated(tmp_path: Path) -> None:
+    f = write(tmp_path, "configured.py", """
+        import environ
+
+        env = environ.Env.configured(
+            scheme={"DEBUG": (bool, False), "REQUIRED": str},
+        )
+        env.bool("DEBUG")
+        env("REQUIRED")
+    """)
+
+    by_name = {usage.name: usage for usage in scan_file(f)}
+    assert by_name["DEBUG"].has_default is True
+    assert by_name["REQUIRED"].has_default is False
+
+
+def test_function_local_bindings_shadow_import_for_whole_scope(tmp_path: Path) -> None:
+    f = write(tmp_path, "late_bindings.py", """
+        import os
+
+        def rebound_later():
+            os.getenv("LOCAL_BEFORE_ASSIGNMENT")
+            os = object()
+
+        def imported_later():
+            os.getenv("LOCAL_BEFORE_IMPORT")
+            import os
+            os.getenv("LOCAL_AFTER_IMPORT")
+    """)
+
+    assert [usage.name for usage in scan_file(f)] == ["LOCAL_AFTER_IMPORT"]
+
+
+def test_class_name_is_bound_after_class_body_runs(tmp_path: Path) -> None:
+    f = write(tmp_path, "class_binding.py", """
+        import os
+
+        class os:
+            value = os.getenv("CLASS_BODY_VALUE")
+
+        os.getenv("AFTER_CLASS")
+    """)
+
+    assert [usage.name for usage in scan_file(f)] == ["CLASS_BODY_VALUE"]
+
+
+def test_import_os_path_binds_os_module(tmp_path: Path) -> None:
+    f = write(tmp_path, "submodule.py", """
+        import os.path
+
+        os.getenv("FROM_SUBMODULE_IMPORT")
+    """)
+
+    assert [usage.name for usage in scan_file(f)] == ["FROM_SUBMODULE_IMPORT"]
+
+
+def test_os_wildcard_import_tracks_exported_env_helpers(tmp_path: Path) -> None:
+    f = write(tmp_path, "wildcard.py", """
+        from os import *
+
+        getenv("WILDCARD_GETENV")
+        environ["WILDCARD_ENVIRON"]
+    """)
+
+    assert {usage.name for usage in scan_file(f)} == {
+        "WILDCARD_GETENV", "WILDCARD_ENVIRON",
+    }
+
+
+def test_configured_env_accepts_positional_scheme(tmp_path: Path) -> None:
+    f = write(tmp_path, "configured_positional.py", """
+        import environ
+
+        env = environ.Env.configured(None, {"PORT": (int, 8000)})
+        env.int("PORT")
+    """)
+
+    usage = scan_file(f)[0]
+    assert usage.name == "PORT"
+    assert usage.has_default is True
+    assert ast.literal_eval(usage.default_node) == 8000
+
+
+def test_mutually_exclusive_branches_keep_possible_aliases(tmp_path: Path) -> None:
+    f = write(tmp_path, "branches.py", """
+        import os
+
+        if enabled:
+            os = object()
+        else:
+            os.getenv("ELSE_BRANCH")
+
+        os.getenv("AFTER_BRANCH")
+    """)
+
+    assert {usage.name for usage in scan_file(f)} == {
+        "ELSE_BRANCH", "AFTER_BRANCH",
+    }
+
+
+def test_try_handlers_see_intermediate_but_not_else_bindings(tmp_path: Path) -> None:
+    f = write(tmp_path, "try_flow.py", """
+        import os
+
+        try:
+            alias = os
+            risky()
+            alias = object()
+        except Exception:
+            alias.getenv("HANDLER_INTERMEDIATE")
+
+        try:
+            pass
+        except Exception:
+            late.getenv("ELSE_BINDING")
+        else:
+            import os as late
+    """)
+
+    assert [usage.name for usage in scan_file(f)] == ["HANDLER_INTERMEDIATE"]
+
+
+@pytest.mark.skipif(sys.version_info < (3, 10), reason="match requires Python 3.10")
+def test_irrefutable_match_capture_rebinds_alias(tmp_path: Path) -> None:
+    f = write(tmp_path, "match_capture.py", """
+        import os
+
+        match value:
+            case os:
+                pass
+
+        os.getenv("AFTER_CAPTURE")
+    """)
+
+    assert scan_file(f) == []
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="type aliases require Python 3.12")
+def test_pep695_type_alias_rebinds_name(tmp_path: Path) -> None:
+    f = write(tmp_path, "type_alias.py", """
+        import os
+        type os = int
+        os.getenv("AFTER_TYPE_ALIAS")
+    """)
+
+    assert scan_file(f) == []
+
+
+def test_attribute_aliases_are_propagated(tmp_path: Path) -> None:
+    f = write(tmp_path, "attribute_aliases.py", """
+        import os
+        import environ
+
+        getter = os.getenv
+        mapping = os.environ
+        EnvClass = environ.Env
+        env = EnvClass()
+
+        getter("GETTER_ALIAS")
+        mapping.get("MAPPING_GET")
+        mapping["MAPPING_ITEM"]
+        env("ENV_CLASS_ALIAS")
+    """)
+
+    assert {usage.name for usage in scan_file(f)} == {
+        "GETTER_ALIAS", "MAPPING_GET", "MAPPING_ITEM", "ENV_CLASS_ALIAS",
+    }
+
+
+def test_django_prefix_and_alias_state_are_tracked(tmp_path: Path) -> None:
+    f = write(tmp_path, "prefix.py", """
+        import environ
+
+        env = environ.Env(DJANGO_DEBUG=(bool, False))
+        alias = env
+        env.prefix = "DJANGO_"
+        alias.bool("DEBUG")
+        alias.db()
+
+        configured = environ.Env.configured(
+            None,
+            {"APP_PORT": (int, 8000)},
+            prefix="APP_",
+        )
+        configured.int("PORT")
+    """)
+
+    by_name = {usage.name: usage for usage in scan_file(f)}
+    assert set(by_name) == {
+        "DJANGO_DEBUG", "DJANGO_DATABASE_URL", "APP_PORT",
+    }
+    assert by_name["DJANGO_DEBUG"].has_default is True
+    assert by_name["APP_PORT"].has_default is True
+
+
+def test_dynamic_django_prefix_becomes_dynamic_usage(tmp_path: Path) -> None:
+    f = write(tmp_path, "dynamic_prefix.py", """
+        import environ
+
+        env = environ.Env()
+        env.prefix = get_prefix()
+        env("TOKEN")
+    """)
+
+    usage = scan_file(f)[0]
+    assert usage.is_dynamic is True
+    assert usage.raw_expr == "env.prefix + ('TOKEN')"
+
+
+def test_function_prefix_mutation_does_not_leak_to_module_state(tmp_path: Path) -> None:
+    f = write(tmp_path, "function_prefix.py", """
+        import environ
+
+        env = environ.Env()
+
+        def configure():
+            env.prefix = "INNER_"
+            env("TOKEN")
+
+        env("OUTER")
+    """)
+
+    assert [usage.name for usage in scan_file(f)] == ["INNER_TOKEN", "OUTER"]
+
+
+def test_comprehension_walrus_keeps_zero_iteration_path(tmp_path: Path) -> None:
+    f = write(tmp_path, "walrus.py", """
+        import os
+
+        [(os := object()) for item in values]
+        os.getenv("MAY_STILL_BE_OS")
+    """)
+
+    assert [usage.name for usage in scan_file(f)] == ["MAY_STILL_BE_OS"]
+
+
+def test_pep263_source_encoding_is_respected(tmp_path: Path) -> None:
+    path = tmp_path / "latin1.py"
+    path.write_bytes(
+        b"# -*- coding: latin-1 -*-\n# caf\xe9\nimport os\nos.getenv('LATIN1')\n"
+    )
+
+    assert [usage.name for usage in scan_file(path)] == ["LATIN1"]
+
+
+def test_deep_ast_becomes_scan_error(tmp_path: Path) -> None:
+    expression = " + ".join("1" for _ in range(2500))
+    path = write(tmp_path, "deep.py", f"value = {expression}\n")
+
+    with pytest.raises(ScanError, match="deeply nested"):
+        scan_file(path)
+
+    result = scan_project(tmp_path)
+    assert len(result.errors) == 1
+    assert result.errors[0][0] == path
+
+
+def test_project_walk_prunes_case_variants_of_excludes(tmp_path: Path) -> None:
+    write(tmp_path, "main.PY", "import os\nos.getenv('MAIN')\n")
+    write(tmp_path, "VENV/ignored.py", "import os\nos.getenv('IGNORED')\n")
+    write(tmp_path, "Node_Modules/ignored.py", "import os\nos.getenv('IGNORED2')\n")
+
+    files = iter_python_files(tmp_path)
+    assert [path.name for path in files] == ["main.PY"]
+    assert scan_project(tmp_path).static_names == {"MAIN"}
+
+
+def test_scan_project_reuses_precomputed_file_list(tmp_path: Path, monkeypatch) -> None:
+    path = write(tmp_path, "main.py", "import os\nos.getenv('ONE_PASS')\n")
+
+    def should_not_walk(*args, **kwargs):
+        raise AssertionError("iter_python_files was called twice")
+
+    monkeypatch.setattr("envsleuth.scanner.iter_python_files", should_not_walk)
+    result = scan_project(tmp_path, files=[path])
+    assert result.static_names == {"ONE_PASS"}
+    assert result.scanned_files == [path]
+
+
+def test_walk_errors_are_reported(tmp_path: Path, monkeypatch) -> None:
+    def broken_walk(root, topdown=True, onerror=None):
+        assert onerror is not None
+        onerror(PermissionError("blocked directory"))
+        yield root, [], []
+
+    monkeypatch.setattr("envsleuth.scanner.os.walk", broken_walk)
+    with pytest.raises(ScanError, match="blocked directory"):
+        iter_python_files(tmp_path)
+
+    result = scan_project(tmp_path)
+    assert len(result.errors) == 1
+    assert "blocked directory" in result.errors[0][1]
+
+
+def test_finally_sees_partial_try_else_and_handler_states(tmp_path: Path) -> None:
+    f = write(tmp_path, "finally_flow.py", """
+        import os
+
+        alias = object()
+        try:
+            alias = os
+            risky()
+            alias = object()
+        finally:
+            alias.getenv("TRY_PARTIAL")
+
+        alias = object()
+        try:
+            risky()
+        except Exception:
+            alias = os
+            risky_again()
+            alias = object()
+        finally:
+            alias.getenv("HANDLER_PARTIAL")
+
+        alias = object()
+        try:
+            pass
+        except Exception:
+            pass
+        else:
+            alias = os
+            risky_in_else()
+            alias = object()
+        finally:
+            alias.getenv("ELSE_PARTIAL")
+    """)
+
+    names = [usage.name for usage in scan_file(f)]
+    assert names == ["TRY_PARTIAL", "HANDLER_PARTIAL", "ELSE_PARTIAL"]
+
+
+def test_except_type_side_effects_feed_later_handlers(tmp_path: Path) -> None:
+    f = write(tmp_path, "handler_types.py", """
+        import os
+
+        try:
+            risky()
+        except ((getter := os.getenv) and ValueError):
+            pass
+        except TypeError:
+            getter("SEQUENTIAL_HANDLER")
+    """)
+
+    assert [usage.name for usage in scan_file(f)] == ["SEQUENTIAL_HANDLER"]
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="except* requires Python 3.11")
+def test_except_star_clauses_share_type_and_handler_body_effects(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "handler_groups.py", """
+        import os
+
+        try:
+            risky_group()
+        except* ((getter := os.getenv) and ValueError):
+            pass
+        except* TypeError:
+            getter("STAR_TYPE_EFFECT")
+
+        try:
+            another_group()
+        except* ValueError:
+            getter2 = os.getenv
+            risky_handler()
+            getter2 = object()
+        except* TypeError:
+            getter2("STAR_BODY_EFFECT")
+    """)
+
+    assert [usage.name for usage in scan_file(f)] == [
+        "STAR_TYPE_EFFECT", "STAR_BODY_EFFECT",
+    ]
+
+
+def test_loop_analysis_reaches_fixpoint_without_duplicate_usages(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "loop_fixpoint.py", """
+        import os
+
+        getter = fallback
+        for item in items:
+            getter("FOR_REPEAT")
+            getter = os.getenv
+
+        getter = fallback
+        while condition:
+            getter("WHILE_REPEAT")
+            getter = os.getenv
+
+        getter = fallback
+        [
+            (getter("COMP_REPEAT"), (getter := os.getenv))
+            for item in items
+        ]
+
+        first = fallback
+        second = fallback
+        third = os.getenv
+        for item in items:
+            first("THREE_PASSES")
+            first = second
+            second = third
+    """)
+
+    names = [usage.name for usage in scan_file(f)]
+    assert names == ["FOR_REPEAT", "WHILE_REPEAT", "COMP_REPEAT", "THREE_PASSES"]
+
+
+def test_long_loop_alias_chain_uses_safe_widening(tmp_path: Path) -> None:
+    count = 40
+    lines = ["import os"]
+    lines.extend(f"alias_{index} = fallback" for index in range(count))
+    lines.extend(["tail = os.getenv", "for item in items:", '    alias_0("LONG_CHAIN")'])
+    lines.extend(
+        f"    alias_{index} = alias_{index + 1}"
+        for index in range(count - 1)
+    )
+    lines.append(f"    alias_{count - 1} = tail")
+    f = write(tmp_path, "long_chain.py", "\n".join(lines))
+
+    assert [usage.name for usage in scan_file(f)] == ["LONG_CHAIN"]
+
+
+@pytest.mark.skipif(sys.version_info < (3, 10), reason="match requires Python 3.10")
+def test_match_failed_guards_feed_later_cases_and_keep_captures(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "match_guards.py", """
+        import os
+
+        alias = object()
+        match value:
+            case 1 if ((alias := os) and False):
+                pass
+            case _:
+                alias.getenv("FAILED_GUARD_STATE")
+
+        match other:
+            case os if False:
+                pass
+        os.getenv("CAPTURE_ALREADY_REBOUND")
+    """)
+
+    assert [usage.name for usage in scan_file(f)] == ["FAILED_GUARD_STATE"]
+
+
+def test_conditional_values_keep_all_possible_alias_kinds(tmp_path: Path) -> None:
+    f = write(tmp_path, "conditional_aliases.py", """
+        import os
+        import environ
+
+        env_a = environ.Env()
+        env_a.prefix = "A_"
+        env_b = environ.Env()
+        env_b.prefix = "B_"
+
+        getter = os.getenv if enabled else fallback
+        mapping = os.environ if enabled else fallback_mapping
+        selected = env_a if enabled else env_b
+        mixed = os.getenv if enabled else env_a
+
+        getter("CONDITIONAL_GETTER")
+        mapping.get("CONDITIONAL_MAPPING")
+        selected("TOKEN")
+        mixed("MIXED_CALL")
+    """)
+
+    usages = scan_file(f)
+    assert {usage.name for usage in usages if usage.name is not None} == {
+        "CONDITIONAL_GETTER", "CONDITIONAL_MAPPING", "MIXED_CALL",
+    }
+    dynamic = [usage for usage in usages if usage.is_dynamic]
+    assert len(dynamic) == 1
+    assert dynamic[0].raw_expr == "selected.prefix + ('TOKEN')"
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="type params require Python 3.12")
+def test_pep695_alias_annotation_scope_shadows_target_and_type_params(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "type_alias_scopes.py", """
+        import os
+
+        type Alias[os] = os.getenv("TYPE_PARAMETER")
+        type RealAlias = os.getenv("REAL_ALIAS")
+        type os = os.getenv("SELF_REFERENCE")
+    """)
+
+    assert [usage.name for usage in scan_file(f)] == ["REAL_ALIAS"]
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="type params require Python 3.12")
+def test_generic_definition_scopes_only_cover_annotations_and_bodies(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "generic_scopes.py", """
+        import os
+
+        @decorate(os.getenv("FUNCTION_DECORATOR"))
+        def configured[os](
+            value: os.getenv("PARAMETER_ANNOTATION") = os.getenv("ARG_DEFAULT"),
+        ) -> os.getenv("RETURN_ANNOTATION"):
+            os.getenv("FUNCTION_BODY")
+
+        @decorate(os.getenv("CLASS_DECORATOR"))
+        class Generic[os](os.getenv("GENERIC_BASE")):
+            value = os.getenv("CLASS_BODY")
+
+        os.getenv("AFTER_GENERIC_DEFINITIONS")
+    """)
+
+    assert [usage.name for usage in scan_file(f)] == [
+        "FUNCTION_DECORATOR",
+        "ARG_DEFAULT",
+        "CLASS_DECORATOR",
+        "AFTER_GENERIC_DEFINITIONS",
+    ]
 
 
 # ============================================================== mixed

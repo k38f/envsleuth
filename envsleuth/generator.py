@@ -9,8 +9,12 @@ Takes a ScanResult and writes a template file with:
 from __future__ import annotations
 
 import ast
+import os
+import re
+import secrets
+import stat
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from envsleuth.scanner import EnvUsage, ScanResult
 
@@ -21,60 +25,177 @@ HEADER = """\
 # Replace the empty values with real defaults/examples, but don't commit secrets.
 """
 
-# chars that mean "this needs quoting" in .env. # is for comments, $ for var
-# expansion in some parsers, the rest are obvious.
-_NEEDS_QUOTING = set(' \t#"\'$\\')
+_PORTABLE_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SAFE_UNQUOTED = re.compile(r"^[A-Za-z0-9_./,:@%+,-]+$")
+_OMITTED_DEFAULT = (
+    "# default omitted: it cannot be represented safely for both dotenv and shell"
+)
+
+
+class GenerationError(Exception):
+    """Base class for errors that make generation incomplete or unsafe."""
+
+
+class IncompleteScanError(GenerationError):
+    def __init__(self, errors: List[Tuple[Path, str]]) -> None:
+        self.errors = list(errors)
+        count = len(errors)
+        super().__init__(f"scan incomplete: {count} file{'s' if count != 1 else ''} failed")
+
+
+class InvalidEnvNameError(GenerationError):
+    def __init__(self, names: List[str]) -> None:
+        self.names = sorted(set(names))
+        shown = ", ".join(repr(name) for name in self.names)
+        super().__init__(f"cannot generate portable assignments for env name(s): {shown}")
+
+
+class EnvNameCollisionError(GenerationError):
+    def __init__(self, groups: List[List[str]]) -> None:
+        self.groups = sorted(
+            (sorted(group) for group in groups),
+            key=lambda group: tuple(name.casefold() for name in group),
+        )
+        shown = "; ".join(" / ".join(group) for group in self.groups)
+        super().__init__(
+            "environment names collide on this platform: " + shown
+        )
 
 
 def _rel(p: Path) -> str:
-    """Display path relative to cwd, fall back to absolute if not possible."""
+    """Display paths without leaking a machine-specific absolute prefix."""
+    if not p.is_absolute():
+        return str(p)
     try:
         return str(p.relative_to(Path.cwd()))
     except ValueError:
-        return str(p)
+        return p.name
 
 
-def _format_value(raw: str) -> str:
-    """Format a value for .env. Quote it if it contains anything special.
-
-    python-dotenv is forgiving but bash `source .env` and JS dotenv are not —
-    they cut at the first '#' and choke on spaces. Better to over-quote.
-    """
+def _format_value(raw: str) -> Optional[str]:
+    """Return a value with the same result in python-dotenv and POSIX shells."""
     if raw == "":
         return ""
-    if any(c in _NEEDS_QUOTING for c in raw):
-        # double quotes + escape backslashes and embedded quotes
+    if raw.endswith("\\"):
+        return None
+    if any(char not in "\n\t" and not char.isprintable() for char in raw):
+        return None
+    try:
+        raw.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    if _SAFE_UNQUOTED.fullmatch(raw):
+        return raw
+    if "$" not in raw and "`" not in raw:
         escaped = raw.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
-    return raw
+    if (
+        "'" not in raw
+        and "${" not in raw
+        and "\\\\" not in raw
+    ):
+        return f"'{raw}'"
+    return None
 
 
-def _literal_from_node(node: Optional[ast.AST]) -> Optional[str]:
+def _literal_from_node(node: Optional[ast.AST]) -> Tuple[Optional[str], bool]:
     """Pull a string default out of an AST node, if it's a literal we recognize."""
     if node is None:
-        return None
-    if isinstance(node, ast.Constant):
-        if node.value is None:
-            return ""  # None default == "no value", same as no default for the example
-        return str(node.value)
+        return None, False
+    try:
+        value = ast.literal_eval(node)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return None, True
+    if value is None:
+        return None, False
+    if isinstance(value, (str, bool, int, float)):
+        try:
+            return str(value), True
+        except (ValueError, MemoryError):
+            return None, True
     # could also try to handle ast.Name pointing at a module-level constant,
     # but that's a rabbit hole — keeping it simple
-    return None
+    return None, True
 
 
-def _pick_default(usages: List[EnvUsage]) -> Optional[str]:
-    """First usage with a usable literal default wins."""
-    for u in usages:
+def _usage_sort_key(usage: EnvUsage) -> Tuple[str, int, str]:
+    return (usage.file.as_posix().casefold(), usage.line, usage.call_type)
+
+
+def _pick_default(usages: List[EnvUsage]) -> Tuple[Optional[str], bool]:
+    """Pick the first portable literal by source location, not scan order."""
+    found_unportable = False
+    for u in sorted(usages, key=_usage_sort_key):
         if not u.has_default:
             continue
-        val = _literal_from_node(u.default_node)
-        if val is not None:
-            return val
-    return None
+        val, should_explain = _literal_from_node(u.default_node)
+        if val is None:
+            found_unportable = found_unportable or should_explain
+            continue
+        formatted = _format_value(val)
+        if formatted is not None:
+            return formatted, False
+        found_unportable = True
+    return None, found_unportable
+
+
+def _one_line(text: str) -> str:
+    pieces: List[str] = []
+    for char in text:
+        if char == "\r":
+            pieces.append("\\r")
+        elif char == "\n":
+            pieces.append("\\n")
+        elif char.isprintable():
+            pieces.append(char)
+        else:
+            pieces.append(ascii(char)[1:-1])
+    return "".join(pieces)
+
+
+def _env_names_case_sensitive() -> bool:
+    return os.name != "nt"
+
+
+def _validate_scan(scan: ScanResult) -> None:
+    if scan.errors:
+        raise IncompleteScanError(scan.errors)
+    invalid = sorted(
+        name for name in scan.static_names
+        if not _PORTABLE_ENV_NAME.fullmatch(name)
+    )
+    if invalid:
+        raise InvalidEnvNameError(invalid)
+    if not _env_names_case_sensitive():
+        by_folded_name: dict = {}
+        for name in scan.static_names:
+            by_folded_name.setdefault(name.casefold(), []).append(name)
+        collisions = [
+            names for names in by_folded_name.values() if len(names) > 1
+        ]
+        if collisions:
+            raise EnvNameCollisionError(collisions)
+
+
+def _append_dynamic_warning(lines: List[str], usages: List[EnvUsage]) -> None:
+    if not usages:
+        return
+    count = len(usages)
+    lines.append(
+        f"# WARNING: {count} dynamic environment variable "
+        f"usage{'s' if count != 1 else ''} could not be resolved."
+    )
+    lines.append("# Add the runtime names manually; unresolved usages:")
+    for usage in sorted(usages, key=_usage_sort_key):
+        location = _one_line(f"{_rel(usage.file)}:{usage.line}")
+        expression = _one_line(usage.raw_expr or "?")
+        lines.append(f"# - {location}: {expression}")
+    lines.append("")
 
 
 def build_env_example(scan: ScanResult) -> str:
     """Produce the text content for a .env.example file."""
+    _validate_scan(scan)
     lines: List[str] = [HEADER]
 
     grouped: dict = {}
@@ -83,32 +204,137 @@ def build_env_example(scan: ScanResult) -> str:
             continue
         grouped.setdefault(u.name, []).append(u)
 
+    _append_dynamic_warning(lines, scan.dynamic_usages)
+
     if not grouped:
-        lines.append("# No environment variables found in code.")
+        if scan.dynamic_usages:
+            lines.append("# No statically resolved environment variables found in code.")
+        else:
+            lines.append("# No environment variables found in code.")
         return "\n".join(lines) + "\n"
 
     for name in sorted(grouped):
         usages = grouped[name]
 
         # show up to 3 locations
-        locations = [f"{_rel(u.file)}:{u.line}" for u in usages[:3]]
+        usages = sorted(usages, key=_usage_sort_key)
+        locations = [
+            _one_line(f"{_rel(u.file)}:{u.line}")
+            for u in usages[:3]
+        ]
         if len(usages) > 3:
             locations.append(f"...and {len(usages) - 3} more")
         lines.append(f"# used at {', '.join(locations)}")
 
-        default = _pick_default(usages)
-        if default is not None and default != "":
-            lines.append(f"{name}={_format_value(default)}")
-        else:
-            lines.append(f"{name}=")
+        default, default_was_omitted = _pick_default(usages)
+        if default_was_omitted:
+            lines.append(_OMITTED_DEFAULT)
+        lines.append(f"{name}={default or ''}")
         lines.append("")  # blank between groups, easier to scan
 
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _unlink_if_same(path: Path, expected: os.stat_result) -> None:
+    try:
+        current = path.lstat()
+    except OSError:
+        return
+    if not os.path.samestat(expected, current):
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _write_exclusive(path: Path, content: str) -> bool:
+    try:
+        stream = path.open("x", encoding="utf-8", newline="\n")
+    except FileExistsError:
+        return False
+
+    created_stat: Optional[os.stat_result] = None
+    try:
+        with stream:
+            created_stat = os.fstat(stream.fileno())
+            stream.write(content)
+        try:
+            current = path.lstat()
+        except OSError as exc:
+            raise OSError("output file disappeared during generation") from exc
+        if not os.path.samestat(created_stat, current):
+            raise OSError("output file was replaced during generation")
+    except BaseException:
+        if created_stat is not None:
+            _unlink_if_same(path, created_stat)
+        raise
+    return True
+
+
 def write_env_example(scan: ScanResult, path: Path, force: bool = False) -> None:
     """Write a .env.example to `path`. Raises FileExistsError if it exists and !force."""
-    if path.exists() and not force:
-        raise FileExistsError(f"{path} already exists (use --force to overwrite)")
     content = build_env_example(scan)
-    path.write_text(content, encoding="utf-8")
+    content.encode("utf-8")
+
+    if not force:
+        if not _write_exclusive(path, content):
+            raise FileExistsError(
+                f"{path} already exists (use --force to overwrite)"
+            ) from None
+        return
+
+    if _write_exclusive(path, content):
+        return
+
+    try:
+        target_info = path.lstat()
+    except FileNotFoundError:
+        if _write_exclusive(path, content):
+            return
+        target_info = path.lstat()
+
+    if stat.S_ISLNK(target_info.st_mode):
+        try:
+            target_mode = stat.S_IMODE(path.stat().st_mode)
+        except FileNotFoundError:
+            target_mode = None
+    else:
+        target_mode = stat.S_IMODE(target_info.st_mode)
+
+    temp_path: Optional[Path] = None
+    temp_stat: Optional[os.stat_result] = None
+    try:
+        for _ in range(10):
+            candidate = path.parent / f".envsleuth-{secrets.token_hex(8)}.tmp"
+            try:
+                stream = candidate.open("x", encoding="utf-8", newline="\n")
+            except FileExistsError:
+                continue
+            temp_path = candidate
+            break
+        else:
+            raise FileExistsError("could not allocate a temporary output file")
+
+        with stream:
+            temp_stat = os.fstat(stream.fileno())
+            used_fd_chmod = (
+                target_mode is not None
+                and os.name != "nt"
+                and hasattr(os, "fchmod")
+            )
+            if used_fd_chmod:
+                os.fchmod(stream.fileno(), target_mode)
+            stream.write(content)
+
+        if not os.path.samestat(temp_stat, temp_path.lstat()):
+            raise OSError("temporary output file was replaced during generation")
+        if target_mode is not None and not used_fd_chmod:
+            os.chmod(temp_path, target_mode)
+        if not os.path.samestat(temp_stat, temp_path.lstat()):
+            raise OSError("temporary output file was replaced during generation")
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None and temp_stat is not None:
+            _unlink_if_same(temp_path, temp_stat)

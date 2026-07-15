@@ -1,5 +1,90 @@
 # Changelog
 
+## 0.3.0 - 2026-07-15
+
+Full bug-audit pass focused on correctness, safe failure modes, and cross-platform
+CLI behavior.
+
+### Scanner and checking
+
+- Fixed AST scope and import tracking around rebinding, function-local names,
+  lambdas and comprehensions, class bodies, relative imports, `import os.path`,
+  and `from os import *`. Aliases now stop matching when Python would shadow
+  them, without hiding valid lookups that run before a class name is bound.
+- Control-flow alias tracking now reaches a bounded fixpoint across loops and
+  comprehensions, preserves intermediate `try`/`except`/`except*`/`finally`
+  states, models guarded `match` cases, and respects PEP 695 type-parameter
+  scopes without quadratic behavior on long alias chains.
+- Environment writes and deletes are no longer reported as reads;
+  augmented assignment still counts because it reads the existing value.
+- Added keyword-name support for stdlib, django-environ, and python-decouple
+  calls, and corrected django-environ positional default signatures.
+- Expanded django-environ handling for constructor schemas, `FileAwareEnv`,
+  `Env.configured(...)`, current helper methods, and helpers with implicit names
+  such as `env.db()` and `env.cache_url()`.
+- Python encoding cookies are now honored. Deep AST recursion, file traversal
+  failures, and inaccessible paths become regular scan errors instead of
+  uncaught exceptions. Excluded directories and extensions are matched without
+  case sensitivity while walking the project, and virtual environments are
+  pruned by their `pyvenv.cfg` marker even when they use a custom directory name.
+- `.env` and `.envignore` accept a UTF-8 BOM. A bare `NAME` line is no longer
+  treated as defined (unlike `NAME=`), and an explicit `default=None` no longer
+  satisfies a required-variable check.
+- Malformed `.env` syntax and embedded NUL bytes now fail as redacted
+  operational errors instead of producing a warning-only false green.
+- Environment names and ignore patterns follow Windows' case-insensitive
+  behavior on Windows while remaining case-sensitive on POSIX. Dynamic-name
+  matching for extra `.env` entries now understands prefixes, suffixes,
+  concatenation, f-strings, `.format()`, and `%` formatting without regex
+  backtracking, repeated parsing, or a Cartesian extra-key × pattern scan.
+- `.env` existence is carried from the same opened snapshot as its values, so
+  a concurrently created or replaced file cannot produce a false-green report.
+
+### Generation and CLI
+
+- `.env.example` generation now fails closed on scan errors or non-portable
+  variable names. Validation happens before opening the target, so even
+  `--force` cannot overwrite a good file with incomplete output.
+- Generated defaults are quoted only when they round-trip through both
+  `python-dotenv` and POSIX shell parsing. Defaults that cannot be represented
+  safely are omitted without leaking their contents, and output uses stable
+  source ordering and LF newlines. This includes terminal-control values and
+  trailing backslashes that could otherwise consume the next assignment.
+- Case-colliding names such as `FOO` and `foo` are rejected on Windows, where
+  the process environment cannot represent them independently.
+- Output replacement is atomic when overwriting an existing example; write
+  failures preserve the previous file and temporary files are cleaned up
+  without deleting a concurrently replaced path. Existing private POSIX modes
+  are applied to the temporary descriptor before any content is written.
+- Dynamic-only and mixed scans leave explicit warning comments in generated
+  files, and the CLI reports how many dynamic lookups were skipped.
+- A missing `.env` or any incomplete scan is now an operational error with exit
+  code 2 in every output mode, even without `--strict`. JSON and GitHub modes
+  still emit their structured reports before exiting.
+- CLI paths and file types are validated up front, read/write/traversal errors
+  are reported without tracebacks, and project enumeration is reused by the
+  progress bar instead of walking the tree twice.
+- Output falls back to ASCII-safe symbols on narrow Windows consoles. GitHub
+  Actions commands now escape message data and property fields according to
+  the toolkit rules, terminal control sequences are neutralized, and a missing
+  environment file emits an error annotation. Operational failures also stay
+  structured in JSON and GitHub output modes.
+
+### Integrations and maintenance
+
+- Update checks now use `packaging.version.Version` for PEP 440 ordering and
+  reject malformed remote versions. Invalid, stale, or future-dated cache data
+  is ignored and repaired on the next successful request. Cache writes are
+  atomic, huge timestamps and non-UTF-8 replies are harmless, cached versions
+  are normalized, and notifications fall back on narrow console encodings.
+- The pre-commit scan hook now reruns for `.env`, `.env.*`, and `.envignore`
+  changes as well as Python changes; the manual generate hook runs even when
+  pre-commit receives no Python filenames.
+- CI now includes Windows tests, manifest validation, sdist/wheel builds, a
+  manual-hook smoke test, and a wheel smoke test outside the source checkout.
+- Package metadata now uses the standardized SPDX license expression and
+  explicitly includes the license file in built distributions.
+
 ## 0.2.0
 
 Feature release. Adds support for popular Django/config libraries, GitHub

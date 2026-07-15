@@ -107,11 +107,13 @@ SECRET_KEY = config('SECRET_KEY')
 DEBUG = config('DEBUG', default=False, cast=bool)
 ```
 
-可识别 `env('X')`、`env.bool('X')`、`env.int('X')`、`env.str('X')`、
-`env.list('X')`、`env.float('X')`、`env.db('X')`、`env.cache('X')`、
-`env.url('X')`、`env.path('X')`、`env.tuple('X')`、`env.dict('X')`、
-`env.json('X')`、`env.search_url('X')` 和 `env.email_url('X')`。
-别名导入也可以正常工作，例如 `from decouple import config as cfg`。
+可识别通过 `env(...)`、`env.get_value(...)` 和类型辅助方法进行的调用：
+`str`、`bytes`、`bool`、`int`、`float`、`json`、`list`、`tuple`、`dict`、
+`url`、`db_url`/`db`、`cache_url`/`cache`、`email_url`/`email`、`search_url`、
+`channels_url`/`channels` 和 `path`。同时支持 `FileAwareEnv` 和
+`Env.configured(...)`，包括其 schema 中声明的默认值和可静态确定的
+`env.prefix` 设置。别名导入也可以正常工作，例如
+`from decouple import config as cfg`。
 
 ## CI：GitHub Actions 注解
 
@@ -132,14 +134,17 @@ DEBUG = config('DEBUG', default=False, cast=bool)
 ```yaml
 repos:
   - repo: https://github.com/k38f/envsleuth
-    rev: v0.2.0
+    rev: v0.3.0
     hooks:
       - id: envsleuth
         # 可选的自定义参数
         # args: [--path, src, --env, .env]
 ```
 
-每次提交触及 Python 文件时，都会运行 `envsleuth scan --strict`。另外还提供可选的 `envsleuth-generate` hook，可通过 `pre-commit run envsleuth-generate --hook-stage manual` 手动重新生成 `.env.example`。
+当 Python 文件、`.env`、`.env.*` 或 `.envignore` 发生变化时，会运行
+`envsleuth scan --strict`。另外还提供可选的 `envsleuth-generate` hook，
+可通过 `pre-commit run envsleuth-generate --hook-stage manual` 手动重新生成
+`.env.example`。
 
 ## `envsleuth generate`
 
@@ -165,6 +170,14 @@ DEBUG=false
 ```
 
 使用 `--force` 覆盖现有文件，使用 `--output path/to/file` 写入其他位置。
+
+生成过程采用 fail-closed 策略：如果任何源文件无法扫描，或变量名无法写成
+可移植的环境变量赋值，命令会以状态码 2 退出，并且不会创建或覆盖目标文件，
+即使使用了 `--force`。动态查找会保留为警告注释。只有能被 `python-dotenv`
+和 POSIX shell 一致解析的字面量默认值才会写入；否则该值会留空，并附带
+`# default omitted` 注释。
+在 Windows 上，仅大小写不同的变量名（例如 `FOO` 和 `foo`）也会被拒绝，
+因为 Windows 环境无法将它们作为两个独立变量保存。
 
 ## `.envignore`
 
@@ -208,12 +221,19 @@ DEBUG_TOOL
 | `--exclude`, `--ext` | 与 `scan` 中的含义相同 |
 | `--no-update-check` | 跳过每周一次的 PyPI 版本检查 |
 
+### 退出状态码
+
+- `0`——命令成功完成。
+- `1`——`scan --strict` 在现有 `.env` 中发现缺失的必需变量。
+- `2`——运行错误，例如 `.env` 不存在、扫描不完整、路径无效，或发生
+  读取、写入、生成错误。JSON 和 GitHub 输出会尽可能先给出结构化错误报告。
+
 ## 更新通知
 
 envsleuth 每周最多检查一次 PyPI 上是否有新版本。当新版本可用时，会向 stderr 输出一行提示：
 
 ```
-ℹ  envsleuth 0.2.0 is available (you have 0.1.1). Run: pip install -U envsleuth
+ℹ  envsleuth 0.3.0 is available (you have 0.2.0). Run: pip install -U envsleuth
 ```
 
 检查结果会被缓存，请求使用很短的超时时间，并且在任何错误情况下（离线、网络被屏蔽等）都保持静默。完全禁用该检查：
@@ -246,6 +266,7 @@ export ENVSLEUTH_NO_UPDATE_CHECK=1
 - [click](https://click.palletsprojects.com/)——CLI
 - [python-dotenv](https://github.com/theskumar/python-dotenv)——解析 `.env`
 - [flashbar](https://github.com/k38f/flashbar)——进度条（一个小巧、零依赖的库；envsleuth 在扫描 20 个以上文件时会使用它）
+- [packaging](https://packaging.pypa.io/)——更新检查所用的 PEP 440 版本比较
 
 扫描器本身只使用 Python 标准库（`ast`）。
 

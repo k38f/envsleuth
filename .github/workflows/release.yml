@@ -1,0 +1,92 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and verify package
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]" build twine check-wheel-contents
+
+      - name: Check version against tag
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+
+          import envsleuth
+
+          with open("pyproject.toml", "rb") as file:
+              project_version = tomllib.load(file)["project"]["version"]
+
+          package_version = envsleuth.__version__
+          tag = os.environ["GITHUB_REF_NAME"]
+
+          assert package_version == project_version, (
+              f"envsleuth.__version__={package_version}, "
+              f"pyproject.toml={project_version}"
+          )
+          assert tag == f"v{project_version}", (
+              f"tag={tag}, expected=v{project_version}"
+          )
+          PY
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Build package
+        run: python -m build
+
+      - name: Check distributions
+        run: |
+          python -m twine check dist/*
+          check-wheel-contents dist/*.whl
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish package
+    needs: build
+    runs-on: ubuntu-latest
+
+    environment:
+      name: pypi
+      url: https://pypi.org/project/envsleuth/
+
+    permissions:
+      id-token: write
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

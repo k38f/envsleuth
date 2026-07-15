@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import ast
 import textwrap
 from pathlib import Path
 
+import pytest
+
+import envsleuth.checker as checker_module
 from envsleuth.checker import (
+    EnvFileParseError,
     check,
     find_nearby_env_files,
     load_env_file,
     load_ignore_patterns,
 )
-from envsleuth.scanner import scan_project
+from envsleuth.scanner import EnvUsage, ScanResult, scan_project
 
 
 def write(path: Path, content: str) -> Path:
@@ -39,6 +44,14 @@ def test_load_env_file_missing(tmp_path: Path) -> None:
     assert load_env_file(tmp_path / "nope.env") == {}
 
 
+def test_load_env_file_rejects_non_regular_path(tmp_path: Path) -> None:
+    env_dir = tmp_path / ".env"
+    env_dir.mkdir()
+
+    with pytest.raises(OSError):
+        load_env_file(env_dir)
+
+
 def test_load_env_file_ignores_comments(tmp_path: Path) -> None:
     env = write(tmp_path / ".env", """
         # comment
@@ -48,6 +61,95 @@ def test_load_env_file_ignores_comments(tmp_path: Path) -> None:
     assert "A" in values
     # dotenv doesn't yield the comment as a key.
     assert not any(k.startswith("#") for k in values)
+
+
+def test_load_env_file_strips_utf8_bom(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    env.write_text("\ufeffFIRST=one\nSECOND=two\n", encoding="utf-8")
+
+    values = load_env_file(env)
+
+    assert values == {"FIRST": "one", "SECOND": "two"}
+
+
+def test_load_env_file_distinguishes_bare_key_from_empty_value(tmp_path: Path) -> None:
+    env = write(tmp_path / ".env", "BARE\nEMPTY=\n")
+
+    values = load_env_file(env)
+
+    assert values["BARE"] is None
+    assert values["EMPTY"] == ""
+
+
+def test_load_env_file_keeps_valid_dotenv_syntax(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    env.write_text(
+        'export EXPORTED="hello world"\n'
+        'MULTILINE="first line\nsecond line"\n'
+        "QUOTED='# is part of the value'\n"
+        "BARE\n",
+        encoding="utf-8",
+    )
+
+    values = load_env_file(env)
+
+    assert values == {
+        "EXPORTED": "hello world",
+        "MULTILINE": "first line\nsecond line",
+        "QUOTED": "# is part of the value",
+        "BARE": None,
+    }
+
+
+def test_load_env_file_rejects_malformed_syntax(tmp_path: Path) -> None:
+    env = write(
+        tmp_path / ".env",
+        'API_SECRET="do-not-leak-this-value\nVALID=1\n',
+    )
+
+    with pytest.raises(EnvFileParseError) as raised:
+        load_env_file(env)
+
+    message = str(raised.value)
+    assert str(env) in message
+    assert "invalid syntax at line 1" in message
+    assert "do-not-leak-this-value" not in message
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["NORMAL=secret\0suffix\n", "BAD\0KEY=secret\n"],
+)
+def test_load_env_file_rejects_nul_in_key_or_value(
+    tmp_path: Path, content: str
+) -> None:
+    env = write(tmp_path / ".env", content)
+
+    with pytest.raises(EnvFileParseError) as raised:
+        load_env_file(env)
+
+    message = str(raised.value)
+    assert str(env) in message
+    assert "NUL byte at line 1" in message
+    assert "secret" not in message
+    assert "\0" not in message
+
+
+def test_load_env_file_uses_one_snapshot(tmp_path: Path, monkeypatch) -> None:
+    env = write(tmp_path / ".env", "FIRST=original\n")
+    real_dotenv_values = checker_module.dotenv_values
+
+    def replace_file_before_dotenv_parse(*args, **kwargs):
+        env.write_text("SECOND=changed\n", encoding="utf-8")
+        return real_dotenv_values(*args, **kwargs)
+
+    monkeypatch.setattr(
+        checker_module, "dotenv_values", replace_file_before_dotenv_parse
+    )
+
+    values = load_env_file(env)
+
+    assert values == {"FIRST": "original"}
 
 
 # --------------------------------------------------------- load_ignore_patterns
@@ -67,6 +169,18 @@ def test_load_ignore_patterns(tmp_path: Path) -> None:
 
 def test_load_ignore_patterns_missing(tmp_path: Path) -> None:
     assert load_ignore_patterns(tmp_path / ".envignore") == []
+
+
+def test_required_ignore_file_missing_raises(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        load_ignore_patterns(tmp_path / ".envignore", required=True)
+
+
+def test_load_ignore_patterns_strips_utf8_bom(tmp_path: Path) -> None:
+    ignore = tmp_path / ".envignore"
+    ignore.write_text("\ufeffTEST_*\nLOCAL_*\n", encoding="utf-8")
+
+    assert load_ignore_patterns(ignore) == ["TEST_*", "LOCAL_*"]
 
 
 # ========================================================================= check
@@ -90,6 +204,18 @@ def test_check_detects_missing(tmp_path: Path) -> None:
     assert present == ["PRESENT"]
 
 
+def test_check_bare_dotenv_key_is_still_missing(tmp_path: Path) -> None:
+    code = tmp_path / "src"
+    write(code / "a.py", "import os\nos.getenv('BARE')\nos.getenv('EMPTY')\n")
+    env = write(tmp_path / ".env", "BARE\nEMPTY=\n")
+
+    report = check(scan_project(code), env)
+
+    assert [v.name for v in report.missing] == ["BARE"]
+    assert [v.name for v in report.present] == ["EMPTY"]
+    assert report.extra_in_env == []
+
+
 def test_check_marks_defaults_as_default_status(tmp_path: Path) -> None:
     code = tmp_path / "src"
     write(code / "a.py", """
@@ -104,6 +230,18 @@ def test_check_marks_defaults_as_default_status(tmp_path: Path) -> None:
     # Not present in .env but has default in code -> status 'default', not 'missing'.
     assert [v.name for v in report.with_default] == ["OPTIONAL"]
     assert report.missing == []
+
+
+def test_default_none_does_not_satisfy_strict_check(tmp_path: Path) -> None:
+    code = tmp_path / "src"
+    write(code / "a.py", "import os\nos.getenv('REQUIRED', None)\n")
+    env = write(tmp_path / ".env", "")
+
+    report = check(scan_project(code), env)
+
+    assert [v.name for v in report.missing] == ["REQUIRED"]
+    assert report.with_default == []
+    assert report.has_issues is True
 
 
 def test_check_default_still_wins_over_present(tmp_path: Path) -> None:
@@ -218,6 +356,220 @@ def test_check_extra_in_env_respects_dynamic_usages(tmp_path: Path) -> None:
     assert report.extra_in_env == ["TOTALLY_UNRELATED"]
 
 
+def test_dynamic_extra_heuristic_honors_prefix_suffix_and_format(tmp_path: Path) -> None:
+    code = tmp_path / "src"
+    write(code / "a.py", """
+        import os
+        region = "EU"
+        os.getenv(f"{region}_TOKEN")
+        os.getenv(f"APP_{region}_SECRET")
+        os.getenv("REGION_{}_URL".format(region))
+        os.getenv(region + "_CERT")
+    """)
+    env = write(tmp_path / ".env", """
+        EU_TOKEN=1
+        APP_EU_SECRET=2
+        REGION_EU_URL=3
+        EU_CERT=4
+        TOKEN_EU=5
+        APP_EU_OTHER=6
+    """)
+
+    report = check(scan_project(code), env)
+
+    assert report.extra_in_env == ["APP_EU_OTHER", "TOKEN_EU"]
+
+
+def test_dynamic_extra_heuristic_supports_percent_formatting(tmp_path: Path) -> None:
+    code = tmp_path / "src"
+    write(code / "a.py", """
+        import os
+        region = "EU"
+        kind = "URL"
+        os.getenv("PREFIX_%s" % region)
+        os.getenv("%s_TOKEN" % region)
+        os.getenv("APP_%s_%s" % (region, kind))
+        os.getenv("RATE_%%_%s" % kind)
+    """)
+    env = write(tmp_path / ".env", """
+        PREFIX_EU=1
+        EU_TOKEN=2
+        APP_EU_URL=3
+        RATE_%_URL=4
+        OTHER=5
+    """)
+
+    report = check(scan_project(code), env)
+
+    assert report.extra_in_env == ["OTHER"]
+
+
+def test_dynamic_index_handles_unanchored_literal_fragments(tmp_path: Path) -> None:
+    code = tmp_path / "src"
+    write(code / "a.py", """
+        import os
+        os.getenv(f"{left}_MID_{right}")
+        os.getenv(f"{left}A{middle}B{right}")
+    """)
+    env = write(tmp_path / ".env", """
+        LEFT_MID_RIGHT=1
+        xAyBz=2
+        LEFT_OTHER_RIGHT=3
+        xAyCz=4
+    """)
+
+    report = check(scan_project(code), env)
+
+    assert report.extra_in_env == ["LEFT_OTHER_RIGHT", "xAyCz"]
+
+
+def test_dynamic_parts_match_large_ambiguous_input_without_regex() -> None:
+    parts = [None]
+    for _ in range(2_000):
+        parts.extend(["A", None])
+    parts.append("B")
+
+    assert checker_module._matches_dynamic_parts(
+        "A" * 2_000 + "B", parts, case_sensitive=True
+    )
+    assert not checker_module._matches_dynamic_parts(
+        "A" * 2_000 + "C", parts, case_sensitive=True
+    )
+
+
+def test_dynamic_expressions_are_parsed_once_per_check(
+    tmp_path: Path, monkeypatch
+) -> None:
+    env_path = write(
+        tmp_path / ".env",
+        "".join(f"EXTRA_{index}=1\n" for index in range(80)),
+    )
+    usages = [
+        EnvUsage(
+            name=None,
+            file=tmp_path / "app.py",
+            line=index + 1,
+            raw_expr=f"'PREFIX_{index}_' + suffix",
+        )
+        for index in range(60)
+    ]
+
+    real_parse = ast.parse
+    calls = 0
+
+    def counting_parse(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_parse(*args, **kwargs)
+
+    monkeypatch.setattr("envsleuth.checker.ast.parse", counting_parse)
+
+    check(ScanResult(usages=usages), env_path)
+    assert calls == len(usages)
+
+
+def test_dynamic_candidate_index_avoids_cartesian_matching(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    count = 300
+    env_path = write(
+        tmp_path / ".env",
+        "".join(f"EXTRA_{index}=1\n" for index in range(count)),
+    )
+    usages = [
+        EnvUsage(
+            name=None,
+            file=tmp_path / "app.py",
+            line=index + 1,
+            raw_expr=f"'PREFIX_{index}_' + suffix",
+        )
+        for index in range(count)
+    ]
+    real_match = checker_module._matches_dynamic_parts
+    calls = 0
+
+    def counting_match(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_match(*args, **kwargs)
+
+    monkeypatch.setattr(checker_module, "_matches_dynamic_parts", counting_match)
+
+    report = check(ScanResult(usages=usages), env_path)
+
+    assert len(report.extra_in_env) == count
+    assert calls <= count
+
+
+def test_dynamic_index_prefers_a_selective_internal_literal(monkeypatch) -> None:
+    count = 300
+    patterns = [
+        ["P", None, f"UNIQUE_{index}_", None]
+        for index in range(count)
+    ]
+    index = checker_module._build_dynamic_pattern_index(patterns, True)
+    real_match = checker_module._matches_dynamic_parts
+    calls = 0
+
+    def counting_match(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_match(*args, **kwargs)
+
+    monkeypatch.setattr(checker_module, "_matches_dynamic_parts", counting_match)
+
+    assert not any(
+        checker_module._looks_like_dynamic_match(f"P_EXTRA_{i}", index)
+        for i in range(count)
+    )
+    assert calls <= count
+
+
+def test_dynamic_index_caps_memory_for_a_long_literal() -> None:
+    prefix = "A" * 100_000
+    parts = [[prefix, None]]
+
+    index = checker_module._build_dynamic_pattern_index(parts, True)
+
+    assert len(index.prefixes) <= checker_module._DYNAMIC_ANCHOR_LENGTH + 1
+    assert checker_module._looks_like_dynamic_match(prefix + "tail", index)
+    assert not checker_module._looks_like_dynamic_match("A" * 99_999, index)
+
+
+def test_check_uses_env_existence_from_the_loaded_snapshot(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    env_path = tmp_path / ".env"
+
+    def missing_snapshot(path: Path):
+        path.write_text("LATE=1\n", encoding="utf-8")
+        return False, {}
+
+    monkeypatch.setattr(
+        checker_module, "_load_env_file_snapshot", missing_snapshot,
+    )
+
+    report = check(ScanResult(), env_path)
+
+    assert env_path.is_file()
+    assert report.env_file_exists is False
+    assert report.has_issues is True
+
+
+def test_dynamic_extra_heuristic_does_not_hide_weak_matches(tmp_path: Path) -> None:
+    code = tmp_path / "src"
+    write(code / "a.py", """
+        import os
+        os.getenv(name)
+        os.getenv(f"{left}_{right}")
+    """)
+    env = write(tmp_path / ".env", "ANY_NAME=1\nOTHER=2\n")
+
+    report = check(scan_project(code), env)
+
+    assert report.extra_in_env == ["ANY_NAME", "OTHER"]
+
+
 def test_has_default_requires_all_usages_to_have_default(tmp_path: Path) -> None:
     # behavior change: previously `any()` of usages had default → counted as default.
     # now we require all usages to have default. otherwise the no-default usage
@@ -263,6 +615,42 @@ def test_check_env_file_missing(tmp_path: Path) -> None:
     assert report.env_file_exists is False
     # All vars are 'missing' because no .env means none are present.
     assert [v.name for v in report.missing] == ["X"]
+    assert report.has_issues is True
+
+
+def test_missing_env_is_an_issue_even_without_required_vars(tmp_path: Path) -> None:
+    scan = scan_project(tmp_path)
+
+    report = check(scan, tmp_path / "missing.env")
+
+    assert report.missing == []
+    assert report.has_issues is True
+
+
+def test_windows_env_names_are_compared_case_insensitively(
+    tmp_path: Path, monkeypatch
+) -> None:
+    code = tmp_path / "src"
+    write(code / "a.py", "import os\nos.getenv('Mixed_Case')\n")
+    env = write(tmp_path / ".env", "MIXED_CASE=value\n")
+    monkeypatch.setattr(checker_module, "_env_names_case_sensitive", lambda: False)
+
+    report = check(scan_project(code), env)
+
+    assert [v.name for v in report.present] == ["Mixed_Case"]
+    assert report.extra_in_env == []
+
+
+def test_posix_env_names_remain_case_sensitive(tmp_path: Path, monkeypatch) -> None:
+    code = tmp_path / "src"
+    write(code / "a.py", "import os\nos.getenv('Mixed_Case')\n")
+    env = write(tmp_path / ".env", "MIXED_CASE=value\n")
+    monkeypatch.setattr(checker_module, "_env_names_case_sensitive", lambda: True)
+
+    report = check(scan_project(code), env)
+
+    assert [v.name for v in report.missing] == ["Mixed_Case"]
+    assert report.extra_in_env == ["MIXED_CASE"]
 
 
 def test_check_dynamic_usages_separated(tmp_path: Path) -> None:

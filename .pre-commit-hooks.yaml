@@ -2,22 +2,23 @@
 #
 #   repos:
 #     - repo: https://github.com/k38f/envsleuth
-#       rev: v0.2.0
+#       rev: v0.3.0
 #       hooks:
 #         - id: envsleuth
 #           # optional, override the default scan target
 #           # args: [--path, src, --env, .env, --strict]
 #
 # By default this runs `envsleuth scan --strict` so missing env vars fail
-# the commit. The hook only runs when .py files change — it doesn't trigger
-# on every commit.
+# the commit. Changes to .env and .envignore also rerun the check since they can
+# change the result without touching Python source.
 
 - id: envsleuth
   name: envsleuth (check .env coverage)
   description: Find env vars in Python code and check they're in .env
   entry: envsleuth scan --strict
   language: python
-  types: [python]
+  types: [file]
+  files: '(^|/)([^/]+\.[pP][yY]|\.env(?:\.[^/]*)?|\.envignore)$'
   pass_filenames: false
   # use ANSI when stdout is a tty (pre-commit usually pipes, so colors get stripped anyway)
   stages: [pre-commit, manual]
@@ -29,4 +30,5 @@
   language: python
   types: [python]
   pass_filenames: false
+  always_run: true
   stages: [manual]  # opt-in only, not run automatically

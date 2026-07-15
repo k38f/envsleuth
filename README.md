@@ -1,20 +1,20 @@
 # envsleuth
 
-🌐 **English** · [简体中文](docs/README.zh-CN.md) · [Русский](docs/README.ru.md)
+🌐 **English** · [简体中文](https://github.com/k38f/envsleuth/blob/main/docs/README.zh-CN.md) · [Русский](https://github.com/k38f/envsleuth/blob/main/docs/README.ru.md)
 
 ![README: generated with AI](https://img.shields.io/badge/README-generated%20with%20AI-6f42c1)
 
 [![tests](https://github.com/k38f/envsleuth/actions/workflows/tests.yml/badge.svg)](https://github.com/k38f/envsleuth/actions/workflows/tests.yml)
 [![pypi](https://img.shields.io/pypi/v/envsleuth.svg)](https://pypi.org/project/envsleuth/)
 [![python](https://img.shields.io/pypi/pyversions/envsleuth.svg)](https://pypi.org/project/envsleuth/)
-[![license](https://img.shields.io/pypi/l/envsleuth.svg)](LICENSE)
+[![license](https://img.shields.io/pypi/l/envsleuth.svg)](https://github.com/k38f/envsleuth/blob/main/LICENSE)
 
 `envsleuth` parses Python source code with AST, finds reads through
 `os.getenv()`, `os.environ[]`, and `os.environ.get()`, then reports variables
 that are missing from `.env`.
 
 
-![envsleuth demo](demo.gif)
+![envsleuth demo](https://raw.githubusercontent.com/k38f/envsleuth/main/demo.gif)
 
 
 ## Install
@@ -110,11 +110,13 @@ SECRET_KEY = config('SECRET_KEY')
 DEBUG = config('DEBUG', default=False, cast=bool)
 ```
 
-All of `env('X')`, `env.bool('X')`, `env.int('X')`, `env.str('X')`,
-`env.list('X')`, `env.float('X')`, `env.db('X')`, `env.cache('X')`,
-`env.url('X')`, `env.path('X')`, `env.tuple('X')`, `env.dict('X')`,
-`env.json('X')`, `env.search_url('X')`, `env.email_url('X')` are detected.
-Aliased imports work too: `from decouple import config as cfg`.
+Calls through `env(...)`, `env.get_value(...)`, and the typed helpers are
+detected: `str`, `bytes`, `bool`, `int`, `float`, `json`, `list`, `tuple`,
+`dict`, `url`, `db_url`/`db`, `cache_url`/`cache`, `email_url`/`email`,
+`search_url`, `channels_url`/`channels`, and `path`. `FileAwareEnv` and
+`Env.configured(...)` are supported too, including defaults declared in their
+schemas and statically known `env.prefix` settings. Aliased imports work as
+well: `from decouple import config as cfg`.
 
 ## CI: GitHub Actions annotations
 
@@ -137,15 +139,15 @@ Add envsleuth to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/k38f/envsleuth
-    rev: v0.2.0
+    rev: v0.3.0
     hooks:
       - id: envsleuth
         # optional overrides
         # args: [--path, src, --env, .env]
 ```
 
-Runs `envsleuth scan --strict` on every commit that touches Python files.
-There's also an opt-in `envsleuth-generate` hook for regenerating
+Runs `envsleuth scan --strict` when Python, `.env`, `.env.*`, or `.envignore`
+files change. There's also an opt-in `envsleuth-generate` hook for regenerating
 `.env.example` manually via `pre-commit run envsleuth-generate --hook-stage manual`.
 
 ## `envsleuth generate`
@@ -172,6 +174,16 @@ DEBUG=false
 ```
 
 Use `--force` to overwrite an existing file, `--output path/to/file` to write elsewhere.
+
+Generation is fail-closed: if a source file cannot be scanned or a variable
+name cannot be written as a portable environment assignment, the command exits
+with code 2 without creating or overwriting the target, even with `--force`.
+Dynamic lookups are preserved as warning comments. Literal defaults are written
+only when they can be represented consistently for both `python-dotenv` and a
+POSIX shell; otherwise the value is left blank with a `# default omitted` note.
+On Windows, generation also rejects names that differ only by case (for
+example, `FOO` and `foo`) because the Windows environment cannot keep them
+separate.
 
 ## `.envignore`
 
@@ -215,12 +227,20 @@ Great for vars that come from CI, Docker, or your shell rc files rather than the
 | `--exclude`, `--ext` | Same as in `scan` |
 | `--no-update-check` | Skip the weekly PyPI version check |
 
+### Exit codes
+
+- `0` — the command completed successfully.
+- `1` — `scan --strict` found required variables missing from an existing `.env`.
+- `2` — an operational failure, such as a missing `.env`, an incomplete scan,
+  an invalid path, or a read/write/generation error. JSON and GitHub output still
+  emit a structured error report first when possible.
+
 ## Update notifications
 
 envsleuth checks PyPI for new releases at most once per week. When a new version is available, it prints a single line to stderr:
 
 ```
-ℹ  envsleuth 0.2.0 is available (you have 0.1.1). Run: pip install -U envsleuth
+ℹ  envsleuth 0.3.0 is available (you have 0.2.0). Run: pip install -U envsleuth
 ```
 
 The check is cached, runs with a short timeout, and stays silent on any error (offline, blocked network, etc). To disable it entirely:
@@ -254,6 +274,7 @@ runtime.
 - [click](https://click.palletsprojects.com/) — CLI
 - [python-dotenv](https://github.com/theskumar/python-dotenv) — `.env` parsing
 - [flashbar](https://github.com/k38f/flashbar) — progress bar used when scanning 20+ files
+- [packaging](https://packaging.pypa.io/) — PEP 440 version comparison for update checks
 
 The scanner itself uses only the Python standard library (`ast`).
 

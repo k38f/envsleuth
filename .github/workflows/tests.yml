@@ -36,3 +36,64 @@ jobs:
         run: |
           envsleuth --version
           envsleuth --help
+
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run tests
+        run: python -m pytest -v
+
+      - name: Smoke test CLI
+        run: |
+          envsleuth --version
+          envsleuth --help
+
+  package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build pre-commit
+          pre-commit validate-manifest .pre-commit-hooks.yaml
+          python -m build
+
+      - name: Smoke test manual generate hook
+        run: |
+          pre-commit try-repo . envsleuth-generate --hook-stage manual --verbose
+          test -f .env.example
+
+      - name: Smoke test the wheel outside the checkout
+        shell: bash
+        run: |
+          python -m venv .wheel-smoke
+          .wheel-smoke/bin/python -m pip install dist/*.whl
+          .wheel-smoke/bin/python -m pip check
+          mkdir -p "$RUNNER_TEMP/envsleuth-wheel-smoke"
+          printf '%s\n' 'import os' 'os.getenv("TOKEN")' > "$RUNNER_TEMP/envsleuth-wheel-smoke/app.py"
+          printf '%s\n' 'TOKEN=example' > "$RUNNER_TEMP/envsleuth-wheel-smoke/.env"
+          cd "$RUNNER_TEMP/envsleuth-wheel-smoke"
+          "$GITHUB_WORKSPACE/.wheel-smoke/bin/envsleuth" --version
+          "$GITHUB_WORKSPACE/.wheel-smoke/bin/envsleuth" --help
+          "$GITHUB_WORKSPACE/.wheel-smoke/bin/envsleuth" scan --strict --no-color --no-update-check

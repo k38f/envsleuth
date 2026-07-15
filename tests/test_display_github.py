@@ -5,9 +5,13 @@ from __future__ import annotations
 import textwrap
 from pathlib import Path
 
-from envsleuth.checker import check
-from envsleuth.display import render_report_github
-from envsleuth.scanner import scan_project
+from envsleuth.checker import CheckReport, VarReport, check
+from envsleuth.display import (
+    _gha_escape_data,
+    _gha_escape_property,
+    render_report_github,
+)
+from envsleuth.scanner import EnvUsage, scan_project
 
 
 def write(tmp_path: Path, name: str, source: str) -> Path:
@@ -67,8 +71,7 @@ def test_notice_when_all_green(tmp_path: Path, monkeypatch) -> None:
     assert "all required env vars defined" in out
 
 
-def test_special_chars_in_message_are_escaped(tmp_path: Path, monkeypatch) -> None:
-    # GHA workflow commands need : and , percent-encoded
+def test_message_uses_actions_toolkit_escape_data(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     write(tmp_path, "src/app.py", """
         import os
@@ -79,17 +82,68 @@ def test_special_chars_in_message_are_escaped(tmp_path: Path, monkeypatch) -> No
     report = check(scan, env)
 
     out = render_report_github(report)
-    # the colon in "Missing env var: VAR..." must be encoded inside the message
-    # the format itself has unescaped colons (::error file=...::msg)
     lines = [l for l in out.splitlines() if l.startswith("::error")]
     assert lines, "expected at least one ::error line"
     for line in lines:
-        # split off the leading ::error and trailing ::message
-        prefix, _, message = line.partition("::error ")
-        _, _, msg = message.partition("::")
-        # the message part should NOT contain literal : or ,
-        assert ":" not in msg, f"unescaped : in message: {msg!r}"
-        assert "," not in msg, f"unescaped , in message: {msg!r}"
+        msg = line.split("::", 2)[2]
+        assert "Missing env var: VAR_WITH_X" in msg
+        assert "%3A" not in msg
+        assert "%2C" not in msg
+
+
+def test_escape_data_and_property_match_actions_toolkit() -> None:
+    raw = "a%b:c,d\r\ne"
+    assert _gha_escape_data(raw) == "a%25b:c,d%0D%0Ae"
+    assert _gha_escape_property(raw) == "a%25b%3Ac%2Cd%0D%0Ae"
+
+
+def test_filename_property_cannot_inject_workflow_command() -> None:
+    usage = EnvUsage(
+        name="SECRET", file=Path("src/a,b%name.py\n::notice::owned"), line=7,
+    )
+    report = CheckReport(
+        variables=[VarReport(
+            name="SECRET", present_in_env=False,
+            has_default_in_code=False, usages=[usage],
+        )],
+        env_file=Path(".env"),
+        env_file_exists=True,
+    )
+
+    out = render_report_github(report)
+
+    assert len(out.splitlines()) == 1
+    assert "file=src/a%2Cb%25name.py%0A%3A%3Anotice%3A%3Aowned" in out
+    assert "\n::notice::owned" not in out
+
+
+def test_message_neutralises_terminal_control_sequences() -> None:
+    name = "SECRET\x1b]8;;https://evil.test\x07CLICK"
+    usage = EnvUsage(name=name, file=Path("src/app.py"), line=7)
+    report = CheckReport(
+        variables=[VarReport(
+            name=name, present_in_env=False,
+            has_default_in_code=False, usages=[usage],
+        )],
+        env_file=Path(".env"),
+        env_file_exists=True,
+    )
+
+    out = render_report_github(report)
+
+    assert "\x1b" not in out
+    assert "\x07" not in out
+    assert r"\x1b]8;;https://evil.test\x07CLICK" in out
+
+
+def test_missing_env_file_is_an_error_not_green_notice() -> None:
+    report = CheckReport(env_file=Path("missing.env"), env_file_exists=False)
+
+    out = render_report_github(report)
+
+    assert out.startswith("::error")
+    assert "Environment file not found" in out
+    assert "all required env vars defined" not in out
 
 
 def test_paths_are_posix(tmp_path: Path, monkeypatch) -> None:
