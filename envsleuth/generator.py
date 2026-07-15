@@ -235,12 +235,42 @@ def build_env_example(scan: ScanResult) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _stat_fingerprint(info: os.stat_result) -> tuple:
+    birthtime_ns = getattr(info, "st_birthtime_ns", None)
+    identity_time_ns = (
+        birthtime_ns
+        if os.name == "nt" and birthtime_ns is not None
+        else info.st_ctime_ns
+    )
+    return (
+        info.st_mode,
+        info.st_size,
+        info.st_mtime_ns,
+        identity_time_ns,
+        info.st_nlink,
+        getattr(info, "st_uid", None),
+        getattr(info, "st_gid", None),
+    )
+
+
+def _same_file_snapshot(
+    expected: os.stat_result,
+    current: os.stat_result,
+) -> bool:
+    # Device + inode alone is not enough after unlink: Linux can immediately
+    # reuse the inode for a different file.
+    return (
+        os.path.samestat(expected, current)
+        and _stat_fingerprint(expected) == _stat_fingerprint(current)
+    )
+
+
 def _unlink_if_same(path: Path, expected: os.stat_result) -> None:
     try:
         current = path.lstat()
     except OSError:
         return
-    if not os.path.samestat(expected, current):
+    if not _same_file_snapshot(expected, current):
         return
     try:
         path.unlink()
@@ -258,12 +288,19 @@ def _write_exclusive(path: Path, content: str) -> bool:
     try:
         with stream:
             created_stat = os.fstat(stream.fileno())
-            stream.write(content)
+            try:
+                stream.write(content)
+                stream.flush()
+            finally:
+                try:
+                    created_stat = os.fstat(stream.fileno())
+                except OSError:
+                    pass
         try:
             current = path.lstat()
         except OSError as exc:
             raise OSError("output file disappeared during generation") from exc
-        if not os.path.samestat(created_stat, current):
+        if not _same_file_snapshot(created_stat, current):
             raise OSError("output file was replaced during generation")
     except BaseException:
         if created_stat is not None:
@@ -318,20 +355,31 @@ def write_env_example(scan: ScanResult, path: Path, force: bool = False) -> None
 
         with stream:
             temp_stat = os.fstat(stream.fileno())
-            used_fd_chmod = (
-                target_mode is not None
-                and os.name != "nt"
-                and hasattr(os, "fchmod")
-            )
-            if used_fd_chmod:
-                os.fchmod(stream.fileno(), target_mode)
-            stream.write(content)
+            try:
+                used_fd_chmod = (
+                    target_mode is not None
+                    and os.name != "nt"
+                    and hasattr(os, "fchmod")
+                )
+                if used_fd_chmod:
+                    os.fchmod(stream.fileno(), target_mode)
+                stream.write(content)
+                stream.flush()
+            finally:
+                try:
+                    temp_stat = os.fstat(stream.fileno())
+                except OSError:
+                    pass
 
-        if not os.path.samestat(temp_stat, temp_path.lstat()):
+        if not _same_file_snapshot(temp_stat, temp_path.lstat()):
             raise OSError("temporary output file was replaced during generation")
         if target_mode is not None and not used_fd_chmod:
             os.chmod(temp_path, target_mode)
-        if not os.path.samestat(temp_stat, temp_path.lstat()):
+            current = temp_path.lstat()
+            if not os.path.samestat(temp_stat, current):
+                raise OSError("temporary output file was replaced during generation")
+            temp_stat = current
+        if not _same_file_snapshot(temp_stat, temp_path.lstat()):
             raise OSError("temporary output file was replaced during generation")
         os.replace(temp_path, path)
         temp_path = None

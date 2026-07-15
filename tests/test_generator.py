@@ -477,7 +477,10 @@ def test_non_force_creation_does_not_use_replace(tmp_path: Path, monkeypatch) ->
     assert dotenv_values(target)["VALUE"] == "safe"
 
 
-def test_cleanup_does_not_delete_replaced_path(tmp_path: Path) -> None:
+def test_cleanup_does_not_delete_replaced_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     from envsleuth.generator import _unlink_if_same
 
     target = tmp_path / ".env.example"
@@ -486,9 +489,27 @@ def test_cleanup_does_not_delete_replaced_path(tmp_path: Path) -> None:
     target.unlink()
     target.write_text("someone else's file\n", encoding="utf-8")
 
+    # Make inode reuse deterministic on filesystems that normally allocate a
+    # different one for the replacement.
+    monkeypatch.setattr(
+        "envsleuth.generator.os.path.samestat",
+        lambda expected, current: True,
+    )
+
     _unlink_if_same(target, created_stat)
 
     assert target.read_text(encoding="utf-8") == "someone else's file\n"
+
+
+def test_cleanup_deletes_unchanged_created_path(tmp_path: Path) -> None:
+    from envsleuth.generator import _unlink_if_same
+
+    target = tmp_path / ".env.example"
+    target.write_text("created\n", encoding="utf-8")
+
+    _unlink_if_same(target, target.lstat())
+
+    assert not target.exists()
 
 
 def test_force_replaces_dangling_symlink(tmp_path: Path) -> None:
