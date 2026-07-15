@@ -1,17 +1,17 @@
 # envsleuth
 
-🌐 **English** · [简体中文](README.zh-CN.md)
+🌐 **English** · [简体中文](docs/README.zh-CN.md) · [Русский](docs/README.ru.md)
 
-*Parts of this README were translated and edited with AI.*
+![README: generated with AI](https://img.shields.io/badge/README-generated%20with%20AI-6f42c1)
 
 [![tests](https://github.com/k38f/envsleuth/actions/workflows/tests.yml/badge.svg)](https://github.com/k38f/envsleuth/actions/workflows/tests.yml)
 [![pypi](https://img.shields.io/pypi/v/envsleuth.svg)](https://pypi.org/project/envsleuth/)
 [![python](https://img.shields.io/pypi/pyversions/envsleuth.svg)](https://pypi.org/project/envsleuth/)
 [![license](https://img.shields.io/pypi/l/envsleuth.svg)](LICENSE)
 
-> 🕵️  The detective for env vars in Python code. Parses your source with AST, finds every `os.getenv()` / `os.environ[]` / `os.environ.get()`, and tells you what's missing from your `.env` file.
-
-No more shipping to prod and realising you forgot `STRIPE_API_KEY`.
+`envsleuth` parses Python source code with AST, finds reads through
+`os.getenv()`, `os.environ[]`, and `os.environ.get()`, then reports variables
+that are missing from `.env`.
 
 
 ![envsleuth demo](demo.gif)
@@ -91,7 +91,7 @@ c = sys_os.getenv("C")
 
 Variables with names computed at runtime (e.g. `os.getenv(f"PREFIX_{x}")`) can't be checked statically — they're reported in a separate warning section so you know they exist.
 
-### Django and config libraries (new in 0.2)
+### Django and config libraries
 
 envsleuth also understands the two most common third-party config patterns:
 
@@ -245,13 +245,15 @@ The cache lives at `~/.cache/envsleuth/last_check.json` (or `$XDG_CACHE_HOME/env
 | Generates `.env.example` from code | ✅ | ❌ | ❌ |
 | Language | Python | Rust | Python |
 
-envsleuth is the only tool here that understands your **source code**. The others either look at your `.env` file in isolation, or read env vars at runtime.
+These tools solve different problems: envsleuth scans source code,
+dotenv-linter inspects `.env` files, and python-decouple reads configuration at
+runtime.
 
 ## Dependencies
 
 - [click](https://click.palletsprojects.com/) — CLI
 - [python-dotenv](https://github.com/theskumar/python-dotenv) — `.env` parsing
-- [flashbar](https://github.com/k38f/flashbar) — progress bar (a tiny zero-dep lib I wrote; envsleuth uses it when scanning 20+ files)
+- [flashbar](https://github.com/k38f/flashbar) — progress bar used when scanning 20+ files
 
 The scanner itself uses only the Python standard library (`ast`).
 
