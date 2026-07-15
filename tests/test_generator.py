@@ -446,6 +446,9 @@ def test_force_sets_private_mode_before_writing(
         def fileno(self):
             return self.wrapped.fileno()
 
+        def flush(self):
+            return self.wrapped.flush()
+
         def write(self, value):
             mode = stat.S_IMODE(os.fstat(self.fileno()).st_mode)
             modes_during_write.append(mode)
