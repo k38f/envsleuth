@@ -289,7 +289,7 @@ def test_maybe_notify_writes_when_newer(fake_cache):
     out = stream.getvalue()
     assert "0.5.0" in out
     assert "0.1.1" in out
-    assert "pip install -U envsleuth" in out
+    assert "python -m pip install --upgrade envsleuth" in out
 
 
 def test_maybe_notify_falls_back_on_a_narrow_stream(fake_cache):

@@ -240,7 +240,7 @@ Great for vars that come from CI, Docker, or your shell rc files rather than the
 envsleuth checks PyPI for new releases at most once per week. When a new version is available, it prints a single line to stderr:
 
 ```
-ℹ  envsleuth 0.3.0 is available (you have 0.2.0). Run: pip install -U envsleuth
+ℹ  envsleuth 0.3.0 is available (you have 0.2.0). Run: python -m pip install --upgrade envsleuth
 ```
 
 The check is cached, runs with a short timeout, and stays silent on any error (offline, blocked network, etc). To disable it entirely:

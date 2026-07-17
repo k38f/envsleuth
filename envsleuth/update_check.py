@@ -207,7 +207,7 @@ def maybe_notify(current_version: str, stream=None) -> None:
             message = (
                 f"ℹ  envsleuth {latest_label} is available "
                 f"(you have {current_label}). "
-                f"Run: pip install -U envsleuth\n"
+                f"Run: python -m pip install --upgrade envsleuth\n"
             )
             stream.write(stream_safe_text(message, stream))
     except Exception:
