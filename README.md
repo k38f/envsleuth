@@ -139,7 +139,7 @@ Add envsleuth to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/k38f/envsleuth
-    rev: v0.3.0
+    rev: v0.3.1
     hooks:
       - id: envsleuth
         # optional overrides
@@ -240,7 +240,7 @@ Great for vars that come from CI, Docker, or your shell rc files rather than the
 envsleuth checks PyPI for new releases at most once per week. When a new version is available, it prints a single line to stderr:
 
 ```
-ℹ  envsleuth 0.3.0 is available (you have 0.2.0). Run: python -m pip install --upgrade envsleuth
+ℹ  envsleuth 0.3.1 is available (you have 0.3.0). Run: python -m pip install --upgrade envsleuth
 ```
 
 The check is cached, runs with a short timeout, and stays silent on any error (offline, blocked network, etc). To disable it entirely:

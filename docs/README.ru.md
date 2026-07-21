@@ -134,7 +134,7 @@ DEBUG = config('DEBUG', default=False, cast=bool)
 ```yaml
 repos:
   - repo: https://github.com/k38f/envsleuth
-    rev: v0.3.0
+    rev: v0.3.1
     hooks:
       - id: envsleuth
         # необязательные переопределения
@@ -238,7 +238,7 @@ DEBUG_TOOL
 envsleuth не чаще раза в неделю проверяет наличие новых выпусков на PyPI. Если новая версия есть, в stderr выводится одна строка:
 
 ```
-ℹ  envsleuth 0.3.0 is available (you have 0.2.0). Run: python -m pip install --upgrade envsleuth
+ℹ  envsleuth 0.3.1 is available (you have 0.3.0). Run: python -m pip install --upgrade envsleuth
 ```
 
 Результат кэшируется, запрос имеет короткий тайм-аут, а при любой ошибке (нет сети, доступ заблокирован и т. д.) проверка молча завершается. Чтобы полностью её отключить:

@@ -134,7 +134,7 @@ DEBUG = config('DEBUG', default=False, cast=bool)
 ```yaml
 repos:
   - repo: https://github.com/k38f/envsleuth
-    rev: v0.3.0
+    rev: v0.3.1
     hooks:
       - id: envsleuth
         # 可选的自定义参数
@@ -233,7 +233,7 @@ DEBUG_TOOL
 envsleuth 每周最多检查一次 PyPI 上是否有新版本。当新版本可用时，会向 stderr 输出一行提示：
 
 ```
-ℹ  envsleuth 0.3.0 is available (you have 0.2.0). Run: python -m pip install --upgrade envsleuth
+ℹ  envsleuth 0.3.1 is available (you have 0.3.0). Run: python -m pip install --upgrade envsleuth
 ```
 
 检查结果会被缓存，请求使用很短的超时时间，并且在任何错误情况下（离线、网络被屏蔽等）都保持静默。完全禁用该检查：

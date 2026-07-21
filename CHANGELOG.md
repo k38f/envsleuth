@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.1 - 2026-07-21
+
+Patch release focused on predictable dependency updates.
+
+- Runtime dependencies now stay within a tested major/minor branch while still
+  accepting patch releases. The selected branches support the full Python
+  3.9-3.14 matrix.
+- Build and development dependencies use the same compatible-release policy,
+  preventing an unrelated feature release from unexpectedly changing CI or
+  package builds.
+- Update notifications now recommend
+  `python -m pip install --upgrade envsleuth`, ensuring pip runs through the
+  selected Python interpreter.
+
 ## 0.3.0 - 2026-07-15
 
 Full bug-audit pass focused on correctness, safe failure modes, and cross-platform
