@@ -2,7 +2,7 @@
 #
 #   repos:
 #     - repo: https://github.com/k38f/envsleuth
-#       rev: v0.3.0
+#       rev: v1.0.0
 #       hooks:
 #         - id: envsleuth
 #           # optional, override the default scan target

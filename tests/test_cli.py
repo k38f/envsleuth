@@ -74,6 +74,276 @@ def test_strict_missing_variable_exits_one(tmp_path: Path, monkeypatch) -> None:
     assert "1 missing" in result.output
 
 
+def test_multiple_env_files_are_checked_after_one_scan(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write(tmp_path, "app.py", "import os\nos.getenv('TOKEN')\n")
+    write(tmp_path, ".env.dev", "TOKEN=dev\n")
+    write(tmp_path, ".env.prod", "")
+    real_scan = cli_module.scan_project
+    calls = {"scan": 0}
+
+    def counted_scan(*args, **kwargs):
+        calls["scan"] += 1
+        return real_scan(*args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "scan_project", counted_scan)
+    result = invoke(
+        "scan",
+        "--env", ".env.dev",
+        "--env", ".env.prod",
+        "--output", "json",
+        "--no-update-check",
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert calls["scan"] == 1
+    assert payload["env_files"] == [
+        str(tmp_path / ".env.dev"),
+        str(tmp_path / ".env.prod"),
+    ]
+    assert payload["summary"]["missing"] == 1
+    assert payload["reports"][0]["summary"]["missing"] == 0
+    assert payload["reports"][1]["summary"]["missing"] == 1
+
+
+def test_multiple_env_files_have_a_cumulative_binding_limit(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_module, "MAX_TOTAL_ENV_BINDINGS", 2)
+    write(tmp_path, "app.py", "value = 1\n")
+    write(tmp_path, ".env.one", "A=1\nB=2\n")
+    write(tmp_path, ".env.two", "C=3\n")
+
+    result = invoke(
+        "scan",
+        "--env", ".env.one",
+        "--env", ".env.two",
+        "--output", "json",
+        "--no-update-check",
+    )
+
+    assert result.exit_code == 2
+    assert "more than 2 unique bindings" in result.output
+
+
+def test_multiple_profiles_cap_projected_variable_reports(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_module, "MAX_TOTAL_REPORT_VARIABLES", 2)
+    write(
+        tmp_path, "app.py",
+        "import os\nos.getenv('A')\nos.getenv('B')\n",
+    )
+    write(tmp_path, ".env.one", "")
+    write(tmp_path, ".env.two", "")
+
+    result = invoke(
+        "scan",
+        "--env", ".env.one",
+        "--env", ".env.two",
+        "--output", "json",
+        "--no-update-check",
+    )
+
+    assert result.exit_code == 2
+    assert "more than 2 variable reports" in result.output
+
+
+def test_fail_on_categories_are_independent(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write(
+        tmp_path, "app.py",
+        "import os\nos.getenv('MISSING')\nos.getenv(name)\n",
+    )
+    write(tmp_path, ".env", "EXTRA=value\n")
+
+    missing = invoke(
+        "scan", "--fail-on", "missing", "--output", "json",
+        "--no-update-check",
+    )
+    extra = invoke(
+        "scan", "--fail-on", "extra", "--output", "json",
+        "--no-update-check",
+    )
+    dynamic = invoke(
+        "scan", "--fail-on", "dynamic", "--output", "json",
+        "--no-update-check",
+    )
+
+    assert missing.exit_code == 1
+    assert extra.exit_code == 1
+    assert dynamic.exit_code == 1
+    assert json.loads(extra.output)["extra_in_env"] == ["EXTRA"]
+
+
+def test_strict_does_not_fail_on_extra_only(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write(tmp_path, "app.py", "value = 1\n")
+    write(tmp_path, ".env", "EXTRA=value\n")
+
+    result = invoke(
+        "scan", "--strict", "--output", "json", "--no-update-check",
+    )
+
+    assert result.exit_code == 0, result.output
+
+
+def test_pyproject_config_is_resolved_from_project_root(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    write(
+        tmp_path,
+        "pyproject.toml",
+        """
+[tool.envsleuth]
+path = "src"
+env = ["profiles/dev.env", "profiles/prod.env"]
+fail-on = ["missing"]
+""",
+    )
+    write(tmp_path, "src/app.py", "import os\nos.getenv('TOKEN')\n")
+    write(tmp_path, "profiles/dev.env", "TOKEN=dev\n")
+    write(tmp_path, "profiles/prod.env", "")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    monkeypatch.chdir(nested)
+
+    result = invoke("scan", "--output", "json", "--no-update-check")
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    assert payload["env_files"] == [
+        str(tmp_path / "profiles/dev.env"),
+        str(tmp_path / "profiles/prod.env"),
+    ]
+
+
+def test_cli_env_replaces_configured_env_list(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write(
+        tmp_path,
+        "pyproject.toml",
+        "[tool.envsleuth]\nenv = ['missing.env']\n",
+    )
+    write(tmp_path, "app.py", "value = 1\n")
+    selected = write(tmp_path, "selected.env", "")
+
+    result = invoke(
+        "scan", "--env", "selected.env", "--output", "json",
+        "--no-update-check",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["env_file"] == str(selected)
+
+
+def test_no_strict_overrides_config_strict(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write(tmp_path, "pyproject.toml", "[tool.envsleuth]\nstrict = true\n")
+    write(tmp_path, "app.py", "import os\nos.getenv('TOKEN')\n")
+    write(tmp_path, ".env", "")
+
+    result = invoke(
+        "scan", "--no-strict", "--output", "json", "--no-update-check",
+    )
+
+    assert result.exit_code == 0, result.output
+
+
+def test_sarif_output_stays_valid_on_policy_failure(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write(tmp_path, "app.py", "import os\nos.getenv('TOKEN')\n")
+    write(tmp_path, ".env", "")
+
+    result = invoke(
+        "scan", "--fail-on", "missing", "--output", "sarif",
+        "--no-update-check",
+    )
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    assert payload["version"] == "2.1.0"
+    assert payload["runs"][0]["results"][0]["ruleId"].endswith(
+        "missing-environment-variable"
+    )
+    assert "\033[" not in result.output
+
+
+def test_sarif_paths_stay_relative_to_repository_root(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write(tmp_path, "src/app.py", "import os\nos.getenv('TOKEN')\n")
+    write(tmp_path, ".env", "")
+
+    for scan_path in ("src", "src/app.py"):
+        result = invoke(
+            "scan", "--path", scan_path, "--output", "sarif",
+            "--no-update-check",
+        )
+
+        assert result.exit_code == 0, result.output
+        finding = json.loads(result.output)["runs"][0]["results"][0]
+        location = finding["locations"][0]["physicalLocation"]
+        assert location["artifactLocation"]["uri"] == "src/app.py"
+
+
+def test_sarif_uses_github_workspace_from_nested_workdir(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    repo = tmp_path / "repo"
+    workdir = repo / "tools"
+    workdir.mkdir(parents=True)
+    write(repo, "src/app.py", "import os\nos.getenv('TOKEN')\n")
+    write(repo, ".env", "")
+    monkeypatch.chdir(workdir)
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(repo))
+
+    result = invoke(
+        "scan", "--path", "../src", "--env", "../.env",
+        "--output", "sarif", "--no-update-check",
+    )
+
+    assert result.exit_code == 0, result.output
+    finding = json.loads(result.output)["runs"][0]["results"][0]
+    location = finding["locations"][0]["physicalLocation"]
+    assert location["artifactLocation"]["uri"] == "src/app.py"
+
+
+def test_missing_env_sarif_is_structured_operational_error(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write(tmp_path, "app.py", "value = 1\n")
+
+    result = invoke(
+        "scan", "--env", "missing.env", "--output", "sarif",
+        "--no-update-check",
+    )
+
+    assert result.exit_code == 2, result.output
+    payload = json.loads(result.output)
+    rule_ids = {
+        item["ruleId"] for item in payload["runs"][0]["results"]
+    }
+    assert "envsleuth/operational-error" in rule_ids
+
+
 def test_missing_env_json_is_structured_operational_error(
     tmp_path: Path, monkeypatch,
 ) -> None:
@@ -190,7 +460,9 @@ def test_env_directory_is_rejected_without_traceback(
     assert "Traceback" not in result.output
 
 
-def test_missing_envignore_is_a_click_error(tmp_path: Path, monkeypatch) -> None:
+def test_missing_envignore_is_a_friendly_error(
+    tmp_path: Path, monkeypatch,
+) -> None:
     monkeypatch.chdir(tmp_path)
     write(tmp_path, "app.py", "value = 1\n")
     write(tmp_path, ".env", "")
@@ -198,7 +470,7 @@ def test_missing_envignore_is_a_click_error(tmp_path: Path, monkeypatch) -> None
     result = invoke("scan", "--envignore", "does-not-exist")
 
     assert result.exit_code == 2
-    assert "does not exist" in result.output
+    assert "not found" in result.output
     assert "Traceback" not in result.output
 
 
@@ -239,14 +511,70 @@ def test_envignore_removed_during_scan_is_not_silently_ignored(
     assert "could not read ignore file" in payload["error"]["message"]
 
 
-def test_missing_scan_path_is_a_click_error(tmp_path: Path, monkeypatch) -> None:
+def test_missing_scan_path_is_a_friendly_error(
+    tmp_path: Path, monkeypatch,
+) -> None:
     monkeypatch.chdir(tmp_path)
 
     result = invoke("scan", "--path", "missing-project")
 
     assert result.exit_code == 2
-    assert "does not exist" in result.output
+    assert "not found" in result.output
     assert "Traceback" not in result.output
+
+
+def test_preflight_path_error_stays_json(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = invoke(
+        "scan", "--path", "missing-project", "--output", "json",
+    )
+
+    assert result.exit_code == 2
+    payload = json.loads(result.output)
+    assert "scan path not found" in payload["error"]["message"]
+
+
+def test_preflight_ignore_error_stays_sarif(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write(tmp_path, "app.py", "value = 1\n")
+    write(tmp_path, ".env", "")
+
+    result = invoke(
+        "scan", "--envignore", "missing.ignore", "--output", "sarif",
+    )
+
+    assert result.exit_code == 2
+    payload = json.loads(result.output)
+    assert payload["version"] == "2.1.0"
+    assert payload["runs"][0]["results"][0]["ruleId"] == (
+        "envsleuth/operational-error"
+    )
+
+
+def test_cumulative_env_size_limit_is_structured(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write(tmp_path, "app.py", "value = 1\n")
+    write(tmp_path, ".env.one", "A=\n")
+    write(tmp_path, ".env.two", "B=\n")
+    monkeypatch.setattr(cli_module, "MAX_TOTAL_ENV_FILE_BYTES", 4)
+
+    result = invoke(
+        "scan",
+        "--env", ".env.one",
+        "--env", ".env.two",
+        "--output", "json",
+    )
+
+    assert result.exit_code == 2
+    payload = json.loads(result.output)
+    assert "cumulative 4-byte limit" in payload["error"]["message"]
 
 
 def test_traversal_oserror_is_friendly(tmp_path: Path, monkeypatch) -> None:

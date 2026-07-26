@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -152,6 +153,58 @@ def test_load_env_file_uses_one_snapshot(tmp_path: Path, monkeypatch) -> None:
     assert values == {"FIRST": "original"}
 
 
+def test_load_env_file_rejects_oversized_input(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    env = write(tmp_path / ".env", "TOKEN=value\n")
+    monkeypatch.setattr(checker_module, "MAX_ENV_FILE_SIZE", 4)
+
+    with pytest.raises(OSError, match="larger than 4 bytes"):
+        load_env_file(env)
+
+
+def test_load_env_file_caps_lines_and_bindings(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    too_many_bindings = write(tmp_path / "bindings.env", "A=1\nB=2\nC=3\n")
+    monkeypatch.setattr(checker_module, "MAX_ENV_BINDINGS", 2)
+
+    with pytest.raises(EnvFileParseError, match="more than 2 bindings"):
+        load_env_file(too_many_bindings)
+
+    too_many_lines = write(tmp_path / "lines.env", "# one\n# two\n# three\n")
+    monkeypatch.setattr(checker_module, "MAX_ENV_LINES", 2)
+
+    with pytest.raises(EnvFileParseError, match="more than 2 lines"):
+        load_env_file(too_many_lines)
+
+
+def test_load_env_file_checks_bytes_read_after_fstat(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    env = write(tmp_path / ".env", "TOKEN=value\n")
+    real_fstat = checker_module.os.fstat
+
+    def stale_fstat(descriptor: int):
+        current = real_fstat(descriptor)
+        return SimpleNamespace(st_mode=current.st_mode, st_size=0)
+
+    monkeypatch.setattr(checker_module, "MAX_ENV_FILE_SIZE", 4)
+    monkeypatch.setattr(checker_module.os, "fstat", stale_fstat)
+
+    with pytest.raises(OSError, match="larger than 4 bytes"):
+        load_env_file(env)
+
+
+def test_load_env_file_does_not_interpolate_process_environment(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("HUGE_SECRET", "do-not-expand")
+    env = write(tmp_path / ".env", "TOKEN=${HUGE_SECRET}\n")
+
+    assert load_env_file(env) == {"TOKEN": "${HUGE_SECRET}"}
+
+
 # --------------------------------------------------------- load_ignore_patterns
 
 
@@ -181,6 +234,57 @@ def test_load_ignore_patterns_strips_utf8_bom(tmp_path: Path) -> None:
     ignore.write_text("\ufeffTEST_*\nLOCAL_*\n", encoding="utf-8")
 
     assert load_ignore_patterns(ignore) == ["TEST_*", "LOCAL_*"]
+
+
+def test_load_ignore_patterns_rejects_non_regular_path(tmp_path: Path) -> None:
+    ignore = tmp_path / ".envignore"
+    ignore.mkdir()
+
+    with pytest.raises(OSError, match="not a regular file"):
+        load_ignore_patterns(ignore, required=True)
+
+
+def test_load_ignore_patterns_rejects_oversized_input(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    ignore = write(tmp_path / ".envignore", "TOKEN\n")
+    monkeypatch.setattr(checker_module, "MAX_IGNORE_FILE_SIZE", 3)
+
+    with pytest.raises(OSError, match="larger than 3 bytes"):
+        load_ignore_patterns(ignore, required=True)
+
+
+def test_load_ignore_patterns_checks_bytes_read_after_fstat(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    ignore = write(tmp_path / ".envignore", "TOKEN\n")
+    real_fstat = checker_module.os.fstat
+
+    def stale_fstat(descriptor: int):
+        current = real_fstat(descriptor)
+        return SimpleNamespace(st_mode=current.st_mode, st_size=0)
+
+    monkeypatch.setattr(checker_module, "MAX_IGNORE_FILE_SIZE", 3)
+    monkeypatch.setattr(checker_module.os, "fstat", stale_fstat)
+
+    with pytest.raises(OSError, match="larger than 3 bytes"):
+        load_ignore_patterns(ignore, required=True)
+
+
+def test_load_ignore_patterns_caps_count_and_length(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(checker_module, "MAX_IGNORE_PATTERNS", 2)
+    too_many = write(tmp_path / ".envignore", "A\nB\nC\n")
+
+    with pytest.raises(OSError, match="more than 2 patterns"):
+        load_ignore_patterns(too_many, required=True)
+
+    monkeypatch.setattr(checker_module, "MAX_IGNORE_PATTERN_LENGTH", 2)
+    too_long = write(tmp_path / ".envignore", "LONG\n")
+
+    with pytest.raises(OSError, match="longer than 2"):
+        load_ignore_patterns(too_long, required=True)
 
 
 # ========================================================================= check
@@ -230,6 +334,27 @@ def test_check_marks_defaults_as_default_status(tmp_path: Path) -> None:
     # Not present in .env but has default in code -> status 'default', not 'missing'.
     assert [v.name for v in report.with_default] == ["OPTIONAL"]
     assert report.missing == []
+
+
+def test_missing_group_tracks_only_unsatisfied_usages(tmp_path: Path) -> None:
+    code = tmp_path / "src"
+    write(code / "a_defaulted.py", """
+        import os
+        os.getenv("TOKEN", "fallback")
+    """)
+    write(code / "z_required.py", """
+        import os
+        os.environ["TOKEN"]
+    """)
+    env = write(tmp_path / ".env", "")
+
+    report = check(scan_project(code), env)
+    variable = report.missing[0]
+
+    assert len(variable.usages) == 2
+    assert [usage.file.name for usage in variable.missing_usages] == [
+        "z_required.py"
+    ]
 
 
 def test_default_none_does_not_satisfy_strict_check(tmp_path: Path) -> None:
@@ -651,6 +776,214 @@ def test_posix_env_names_remain_case_sensitive(tmp_path: Path, monkeypatch) -> N
 
     assert [v.name for v in report.missing] == ["Mixed_Case"]
     assert report.extra_in_env == ["MIXED_CASE"]
+
+
+def test_pydantic_usage_can_match_env_name_case_insensitively(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        checker_module, "_env_names_case_sensitive", lambda: True,
+    )
+    env = write(tmp_path / ".env", "API_KEY=value\n")
+    usage = EnvUsage(
+        name="api_key",
+        file=tmp_path / "settings.py",
+        line=4,
+        call_type="pydantic_settings",
+        accepted_names=("api_key",),
+        case_sensitive=False,
+    )
+
+    report = check(ScanResult(usages=[usage]), env)
+
+    assert [item.name for item in report.present] == ["api_key"]
+    assert report.missing == []
+    assert report.extra_in_env == []
+
+
+def test_same_name_with_mixed_case_modes_is_one_requirement(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        checker_module, "_env_names_case_sensitive", lambda: True,
+    )
+    env = write(tmp_path / ".env", "TOKEN=value\n")
+    usages = [
+        EnvUsage(
+            name="TOKEN", file=tmp_path / "app.py", line=1,
+            call_type="getenv",
+        ),
+        EnvUsage(
+            name="TOKEN", file=tmp_path / "settings.py", line=2,
+            call_type="pydantic_settings", case_sensitive=False,
+        ),
+    ]
+
+    report = check(ScanResult(usages=usages), env)
+
+    assert len(report.variables) == 1
+    assert report.variables[0].status == "present"
+    assert len(report.variables[0].usages) == 2
+
+
+def test_case_sensitive_dotenv_keeps_case_variants_on_windows(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        checker_module, "_env_names_case_sensitive", lambda: False,
+    )
+    env = write(tmp_path / ".env", "token=lower\nTOKEN=upper\n")
+    usage = EnvUsage(
+        name="token",
+        file=tmp_path / "settings.py",
+        line=2,
+        call_type="pydantic_settings",
+        case_sensitive=True,
+    )
+
+    report = check(ScanResult(usages=[usage]), env)
+
+    assert [item.name for item in report.present] == ["token"]
+    assert report.extra_in_env == ["TOKEN"]
+
+
+def test_dynamic_pydantic_pattern_uses_its_case_mode(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        checker_module, "_env_names_case_sensitive", lambda: True,
+    )
+    env = write(tmp_path / ".env", "APP_TOKEN=value\n")
+    usage = EnvUsage(
+        name=None,
+        file=tmp_path / "settings.py",
+        line=2,
+        call_type="pydantic_settings",
+        raw_expr='f"app_{field}"',
+        case_sensitive=False,
+    )
+
+    report = check(ScanResult(usages=[usage]), env)
+
+    assert report.extra_in_env == []
+
+
+def test_pydantic_none_default_is_not_required(tmp_path: Path) -> None:
+    env = write(tmp_path / ".env", "")
+    usage = EnvUsage(
+        name="optional_token",
+        file=tmp_path / "settings.py",
+        line=4,
+        has_default=True,
+        default_node=ast.Constant(value=None),
+        call_type="pydantic_settings",
+        case_sensitive=False,
+    )
+
+    report = check(ScanResult(usages=[usage]), env)
+
+    assert [item.name for item in report.with_default] == ["optional_token"]
+    assert report.missing == []
+
+
+def test_pydantic_scanner_and_checker_integration(tmp_path: Path) -> None:
+    code = tmp_path / "src"
+    write(code / "settings.py", """
+        from pydantic import AliasChoices, Field
+        from pydantic_settings import BaseSettings, SettingsConfigDict
+
+        class Settings(BaseSettings):
+            model_config = SettingsConfigDict(env_prefix="APP_")
+            required: str
+            generated: str = Field(default_factory=lambda: "fallback")
+            token: str = Field(
+                validation_alias=AliasChoices("TOKEN", "OLD_TOKEN")
+            )
+    """)
+    env = write(
+        tmp_path / ".env",
+        "APP_REQUIRED=value\nOLD_TOKEN=legacy\n",
+    )
+
+    report = check(scan_project(code), env)
+
+    assert report.missing == []
+    assert [item.name for item in report.present] == [
+        "APP_required", "TOKEN",
+    ]
+    assert [item.name for item in report.with_default] == ["APP_generated"]
+    assert report.extra_in_env == []
+
+
+def test_alias_choices_are_one_requirement_and_all_aliases_are_known(
+    tmp_path: Path,
+) -> None:
+    env = write(tmp_path / ".env", "LEGACY_TOKEN=value\nTOKEN=also-valid\n")
+    usage = EnvUsage(
+        name="TOKEN",
+        file=tmp_path / "settings.py",
+        line=5,
+        call_type="pydantic_settings",
+        accepted_names=("TOKEN", "LEGACY_TOKEN"),
+        case_sensitive=False,
+    )
+
+    report = check(ScanResult(usages=[usage]), env)
+
+    assert [item.name for item in report.present] == ["TOKEN"]
+    assert report.extra_in_env == []
+
+
+def test_alias_choice_does_not_mask_an_unsatisfied_plain_usage(
+    tmp_path: Path,
+) -> None:
+    env = write(tmp_path / ".env", "LEGACY_TOKEN=value\n")
+    settings = tmp_path / "settings.py"
+    choices = EnvUsage(
+        name="TOKEN",
+        file=settings,
+        line=5,
+        call_type="pydantic_settings",
+        accepted_names=("TOKEN", "LEGACY_TOKEN"),
+        case_sensitive=False,
+    )
+    plain = EnvUsage(
+        name="TOKEN",
+        file=settings,
+        line=9,
+        call_type="getenv",
+        case_sensitive=False,
+    )
+
+    report = check(ScanResult(usages=[choices, plain]), env)
+
+    assert [item.name for item in report.missing] == ["TOKEN"]
+
+
+def test_default_only_needs_to_cover_unsatisfied_usage(tmp_path: Path) -> None:
+    env = write(tmp_path / ".env", "LEGACY_TOKEN=value\n")
+    settings = tmp_path / "settings.py"
+    choices = EnvUsage(
+        name="TOKEN",
+        file=settings,
+        line=5,
+        accepted_names=("TOKEN", "LEGACY_TOKEN"),
+        case_sensitive=False,
+    )
+    default_node = ast.Constant(value="fallback")
+    plain = EnvUsage(
+        name="TOKEN",
+        file=settings,
+        line=9,
+        has_default=True,
+        default_node=default_node,
+        case_sensitive=False,
+    )
+
+    report = check(ScanResult(usages=[choices, plain]), env)
+
+    assert [item.name for item in report.with_default] == ["TOKEN"]
+    assert report.missing == []
 
 
 def test_check_dynamic_usages_separated(tmp_path: Path) -> None:

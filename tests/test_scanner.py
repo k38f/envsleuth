@@ -1129,6 +1129,26 @@ def test_walk_errors_are_reported(tmp_path: Path, monkeypatch) -> None:
     assert "blocked directory" in result.errors[0][1]
 
 
+def test_scan_caps_file_and_usage_counts(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    write(tmp_path, "one.py", "import os\nos.getenv('A')\nos.getenv('B')\n")
+    write(tmp_path, "two.py", "value = 2\n")
+    write(tmp_path, "three.py", "value = 3\n")
+
+    monkeypatch.setattr("envsleuth.scanner.MAX_SCAN_FILES", 2)
+    with pytest.raises(ScanError, match="more than 2 files"):
+        iter_python_files(tmp_path)
+
+    monkeypatch.setattr("envsleuth.scanner.MAX_SCAN_FILES", 50_000)
+    monkeypatch.setattr("envsleuth.scanner.MAX_SCAN_USAGES", 1)
+    result = scan_project(tmp_path)
+
+    assert len(result.usages) == 1
+    assert len(result.errors) == 1
+    assert "more than 1 environment-variable usages" in result.errors[0][1]
+
+
 def test_finally_sees_partial_try_else_and_handler_states(tmp_path: Path) -> None:
     f = write(tmp_path, "finally_flow.py", """
         import os
@@ -1356,6 +1376,551 @@ def test_generic_definition_scopes_only_cover_annotations_and_bodies(
         "CLASS_DECORATOR",
         "AFTER_GENERIC_DEFINITIONS",
     ]
+
+
+# ====================================================== pydantic-settings
+
+
+def test_pydantic_settings_fields_and_defaults(tmp_path: Path) -> None:
+    f = write(tmp_path, "settings.py", """
+        from typing import Optional
+        from pydantic import Field
+        from pydantic_settings import BaseSettings
+
+        class Settings(BaseSettings):
+            required: str
+            optional_type_only: Optional[str]
+            assigned: int = 3
+            none_default: Optional[str] = None
+            field_required: str = Field(...)
+            field_default: str = Field(default="fallback")
+            generated: list[str] = Field(default_factory=list)
+            _private: str
+    """)
+
+    usages = {
+        usage.name: usage for usage in scan_file(f)
+        if usage.call_type == "pydantic_settings"
+    }
+
+    assert set(usages) == {
+        "required",
+        "optional_type_only",
+        "assigned",
+        "none_default",
+        "field_required",
+        "field_default",
+        "generated",
+    }
+    assert usages["required"].has_default is False
+    assert usages["optional_type_only"].has_default is False
+    assert usages["field_required"].has_default is False
+    assert usages["assigned"].has_default is True
+    assert usages["none_default"].has_default is True
+    assert usages["field_default"].has_default is True
+    assert usages["generated"].has_default is True
+    assert usages["generated"].default_node is None
+    assert all(usage.case_sensitive is False for usage in usages.values())
+
+
+def test_pydantic_prefix_applies_even_when_config_follows_fields(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "settings.py", """
+        from pydantic_settings import BaseSettings, SettingsConfigDict
+
+        class Settings(BaseSettings):
+            token: str
+            model_config = SettingsConfigDict(env_prefix="APP_")
+    """)
+
+    usage = scan_file(f)[0]
+
+    assert usage.name == "APP_token"
+    assert usage.accepted_names == ("APP_token",)
+
+
+def test_pydantic_aliases_override_prefix_and_choices_are_one_of(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "settings.py", """
+        from pydantic import AliasChoices, Field
+        from pydantic_settings import BaseSettings, SettingsConfigDict
+
+        class Settings(BaseSettings):
+            model_config = SettingsConfigDict(env_prefix="APP_")
+            plain: str
+            aliased: str = Field(alias="DIRECT")
+            chosen: str = Field(
+                alias="IGNORED",
+                validation_alias=AliasChoices("TOKEN", "LEGACY_TOKEN"),
+            )
+            output_name: str = Field(serialization_alias="SERIALIZED")
+    """)
+
+    usages = {usage.name: usage for usage in scan_file(f)}
+
+    assert set(usages) == {
+        "APP_plain", "DIRECT", "TOKEN", "APP_output_name",
+    }
+    assert usages["TOKEN"].accepted_names == ("TOKEN", "LEGACY_TOKEN")
+
+
+def test_pydantic_module_and_assignment_aliases(tmp_path: Path) -> None:
+    f = write(tmp_path, "settings.py", """
+        import pydantic as pd
+        import pydantic_settings as ps
+
+        Base = ps.BaseSettings
+        Config = ps.SettingsConfigDict
+        F = pd.Field
+        Choices = pd.AliasChoices
+
+        class Settings(Base):
+            model_config = Config(env_prefix="SERVICE_")
+            endpoint: str
+            token: str = F(validation_alias=Choices("TOKEN", "OLD_TOKEN"))
+    """)
+
+    usages = {usage.name: usage for usage in scan_file(f)}
+
+    assert set(usages) == {"SERVICE_endpoint", "TOKEN"}
+    assert usages["TOKEN"].accepted_names == ("TOKEN", "OLD_TOKEN")
+
+
+def test_pydantic_annotated_field_and_classvar(tmp_path: Path) -> None:
+    f = write(tmp_path, "settings.py", """
+        from typing import Annotated, ClassVar
+        from pydantic import Field
+        from pydantic_settings import BaseSettings
+
+        class Settings(BaseSettings):
+            token: Annotated[str, Field(validation_alias="TOKEN")]
+            metadata: ClassVar[str] = "not an env field"
+    """)
+
+    usages = scan_file(f)
+
+    assert [usage.name for usage in usages] == ["TOKEN"]
+
+
+def test_pydantic_class_keywords_and_inherited_config(tmp_path: Path) -> None:
+    f = write(tmp_path, "settings.py", """
+        from pydantic_settings import BaseSettings
+
+        class Base(BaseSettings, env_prefix="BASE_", case_sensitive=True):
+            parent: str
+
+        class Child(Base):
+            child: str
+    """)
+
+    usages = {usage.name: usage for usage in scan_file(f)}
+
+    assert set(usages) == {"BASE_parent", "BASE_child"}
+    assert all(usage.case_sensitive is True for usage in usages.values())
+
+
+def test_pydantic_multiple_bases_follow_base_settings_config_merge(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "settings.py", """
+        from pydantic_settings import BaseSettings, SettingsConfigDict
+
+        class Prefixed(BaseSettings):
+            model_config = SettingsConfigDict(env_prefix="APP_")
+
+        class Sensitive(BaseSettings):
+            model_config = SettingsConfigDict(case_sensitive=True)
+
+        class Settings(Prefixed, Sensitive):
+            token: str
+    """)
+
+    usage = scan_file(f)[0]
+
+    assert usage.name == "token"
+    assert usage.case_sensitive is True
+
+
+def test_dynamic_pydantic_config_is_reported_not_guessed(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "settings.py", """
+        from pydantic import Field
+        from pydantic_settings import BaseSettings, SettingsConfigDict
+
+        class Settings(BaseSettings):
+            model_config = SettingsConfigDict(env_prefix=get_prefix())
+            token: str
+            selected: str = Field(validation_alias=get_alias())
+    """)
+
+    usages = scan_file(f)
+
+    assert len(usages) == 2
+    assert all(usage.is_dynamic for usage in usages)
+    assert {usage.raw_expr for usage in usages} == {
+        "model_config['env_prefix'] + 'token'",
+        "get_alias()",
+    }
+
+
+def test_pydantic_case_sensitivity_can_be_enabled_with_plain_dict(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "settings.py", """
+        from pydantic_settings import BaseSettings
+
+        class Settings(BaseSettings):
+            model_config = {
+                "env_prefix": "Exact_",
+                "case_sensitive": True,
+            }
+            token: str
+    """)
+
+    usage = scan_file(f)[0]
+
+    assert usage.name == "Exact_token"
+    assert usage.case_sensitive is True
+
+
+def test_rebound_or_relative_pydantic_names_do_not_match(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "settings.py", """
+        from .pydantic_settings import BaseSettings as RelativeBase
+        from pydantic_settings import BaseSettings
+
+        BaseSettings = object
+
+        class One(BaseSettings):
+            token: str
+
+        class Two(RelativeBase):
+            other: str
+    """)
+
+    assert scan_file(f) == []
+
+
+def test_pydantic_default_factory_is_never_executed(tmp_path: Path) -> None:
+    marker = tmp_path / "SHOULD_NOT_EXIST"
+    f = write(tmp_path, "settings.py", f"""
+        from pydantic import Field
+        from pydantic_settings import BaseSettings
+
+        class Settings(BaseSettings):
+            token: str = Field(
+                default_factory=lambda: open({str(marker)!r}, "w").write("bad")
+            )
+    """)
+
+    usage = scan_file(f)[0]
+
+    assert usage.has_default is True
+    assert not marker.exists()
+
+
+def test_pydantic_env_prefix_target_controls_aliases_and_variables(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "settings.py", """
+        from pydantic import Field
+        from pydantic_settings import BaseSettings, SettingsConfigDict
+
+        class DefaultTarget(BaseSettings):
+            model_config = SettingsConfigDict(env_prefix="DEF_")
+            plain_default: str
+            named_default: str = Field(alias="DEFAULT_ALIAS")
+
+        class AllTarget(BaseSettings):
+            model_config = SettingsConfigDict(
+                env_prefix="ALL_",
+                env_prefix_target="all",
+            )
+            plain_all: str
+            named_all: str = Field(alias="ALL_ALIAS")
+
+        class AliasTarget(
+            BaseSettings,
+            env_prefix="ONLY_ALIAS_",
+            env_prefix_target="alias",
+        ):
+            plain_alias_target: str
+            named_alias_target: str = Field(alias="NAMED")
+    """)
+
+    usages = {usage.name: usage for usage in scan_file(f)}
+
+    assert set(usages) == {
+        "DEF_plain_default",
+        "DEFAULT_ALIAS",
+        "ALL_plain_all",
+        "ALL_ALL_ALIAS",
+        "plain_alias_target",
+        "ONLY_ALIAS_NAMED",
+    }
+
+
+def test_pydantic_subclass_reapplies_config_to_inherited_fields(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "settings.py", """
+        from pydantic import Field
+        from pydantic_settings import BaseSettings, SettingsConfigDict
+
+        class Common(BaseSettings):
+            token: str
+            endpoint: str = Field(alias="ENDPOINT")
+
+        class Production(Common):
+            model_config = SettingsConfigDict(
+                env_prefix="PROD_",
+                env_prefix_target="all",
+                case_sensitive=True,
+            )
+    """)
+
+    usages = scan_file(f)
+    by_name = {usage.name: usage for usage in usages}
+
+    assert set(by_name) == {
+        "token",
+        "ENDPOINT",
+        "PROD_token",
+        "PROD_ENDPOINT",
+    }
+    assert by_name["token"].case_sensitive is False
+    assert by_name["PROD_token"].case_sensitive is True
+    assert by_name["PROD_ENDPOINT"].case_sensitive is True
+
+
+def test_pydantic_unpacked_config_is_dynamic_instead_of_guessed(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "settings.py", """
+        from pydantic_settings import BaseSettings, SettingsConfigDict
+
+        CONFIG = {"env_prefix": "APP_"}
+
+        class KeywordUnpack(BaseSettings):
+            model_config = SettingsConfigDict(**CONFIG)
+            token: str
+
+        class DictUnpack(BaseSettings):
+            model_config = {**CONFIG}
+            endpoint: str
+
+        class PositionalMapping(BaseSettings):
+            model_config = SettingsConfigDict(CONFIG)
+            host: str
+    """)
+
+    usages = scan_file(f)
+
+    assert len(usages) == 3
+    assert all(usage.is_dynamic for usage in usages)
+    assert {usage.raw_expr for usage in usages} == {"model_config"}
+
+
+def test_pydantic_model_config_mutations_are_dynamic(tmp_path: Path) -> None:
+    f = write(tmp_path, "settings.py", """
+        from pydantic_settings import BaseSettings, SettingsConfigDict
+
+        class ItemAssignment(BaseSettings):
+            model_config = SettingsConfigDict()
+            model_config["env_prefix"] = "APP_"
+            token: str
+
+        class MethodMutation(BaseSettings):
+            model_config = SettingsConfigDict()
+            model_config.update(case_sensitive=True)
+            endpoint: str
+
+        class EscapedConfig(BaseSettings):
+            model_config = SettingsConfigDict()
+            configure(model_config)
+            host: str
+
+        class AliasedConfig(BaseSettings):
+            model_config = SettingsConfigDict()
+            cfg = model_config
+            cfg.update({"env_prefix": "ALIAS_"})
+            port: int
+    """)
+
+    usages = scan_file(f)
+
+    assert len(usages) == 4
+    assert all(usage.is_dynamic for usage in usages)
+    assert {usage.raw_expr for usage in usages} == {"model_config"}
+
+
+def test_pydantic_method_body_does_not_mutate_outer_config(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "settings.py", """
+        from pydantic_settings import BaseSettings
+
+        class Settings(BaseSettings):
+            token: str
+
+            @staticmethod
+            def merge(model_config):
+                model_config.update({"env_prefix": "NOT_OUTER_"})
+    """)
+
+    usage = scan_file(f)[0]
+
+    assert usage.name == "token"
+    assert usage.is_dynamic is False
+
+
+def test_pydantic_only_last_model_config_assignment_is_effective(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "settings.py", """
+        from pydantic_settings import BaseSettings, SettingsConfigDict
+
+        class Reassigned(BaseSettings):
+            model_config = SettingsConfigDict(env_prefix="OLD_")
+            model_config = SettingsConfigDict(case_sensitive=True)
+            token: str
+
+        class Conditional(BaseSettings):
+            if enabled:
+                model_config = SettingsConfigDict(env_prefix="MAYBE_")
+            endpoint: str
+
+        class Recovered(BaseSettings):
+            if enabled:
+                model_config = SettingsConfigDict(env_prefix="MAYBE_")
+            model_config = SettingsConfigDict(env_prefix="FINAL_")
+            host: str
+    """)
+
+    usages = scan_file(f)
+    static = {usage.name: usage for usage in usages if usage.name is not None}
+    dynamic = [usage for usage in usages if usage.is_dynamic]
+
+    assert set(static) == {"token", "FINAL_host"}
+    assert static["token"].case_sensitive is True
+    assert len(dynamic) == 1
+    assert dynamic[0].raw_expr == "model_config"
+
+
+def test_pydantic_bare_field_annotation_does_not_shadow_import(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "settings.py", """
+        from pydantic import Field
+        from pydantic_settings import BaseSettings
+
+        class Settings(BaseSettings):
+            Field: str
+            token: str = Field(alias="TOKEN")
+    """)
+
+    usages = scan_file(f)
+
+    assert [usage.name for usage in usages] == ["Field", "TOKEN"]
+
+
+def test_pydantic_alias_generator_makes_unaliased_fields_dynamic(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "settings.py", """
+        from pydantic import Field
+        from pydantic_settings import BaseSettings, SettingsConfigDict
+
+        class Settings(BaseSettings):
+            model_config = SettingsConfigDict(alias_generator=to_camel)
+            api_key: str
+            explicit: str = Field(alias="EXPLICIT")
+    """)
+
+    usages = scan_file(f)
+    dynamic = [usage for usage in usages if usage.is_dynamic]
+
+    assert len(dynamic) == 1
+    assert dynamic[0].raw_expr == "alias_generator('api_key')"
+    assert [usage.name for usage in usages if not usage.is_dynamic] == [
+        "EXPLICIT"
+    ]
+
+
+def test_dynamic_pydantic_case_mode_does_not_guess_name_matching(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "settings.py", """
+        from pydantic_settings import BaseSettings, SettingsConfigDict
+
+        class Settings(BaseSettings):
+            model_config = SettingsConfigDict(
+                env_prefix="APP_",
+                case_sensitive=get_case_mode(),
+            )
+            token: str
+    """)
+
+    usage = scan_file(f)[0]
+
+    assert usage.is_dynamic
+    assert usage.raw_expr == "model_config['case_sensitive']"
+    assert usage.case_sensitive is None
+
+
+def test_pydantic_name_semantics_we_do_not_model_are_dynamic(
+    tmp_path: Path,
+) -> None:
+    f = write(tmp_path, "settings.py", """
+        from pydantic import Field
+        from pydantic_settings import BaseSettings, SettingsConfigDict
+
+        class Nested(BaseSettings):
+            model_config = SettingsConfigDict(env_nested_delimiter="__")
+            database: dict
+
+        class EmptyIgnored(BaseSettings):
+            model_config = SettingsConfigDict(env_ignore_empty=True)
+            token: str
+
+        class NameFallback(BaseSettings):
+            model_config = SettingsConfigDict(populate_by_name=True)
+            endpoint: str = Field(alias="ENDPOINT")
+    """)
+
+    usages = scan_file(f)
+
+    assert len(usages) == 3
+    assert all(usage.is_dynamic for usage in usages)
+    assert all(
+        usage.raw_expr is not None
+        and usage.raw_expr.startswith("model_config")
+        for usage in usages
+    )
+
+
+def test_pydantic_custom_sources_are_not_guessed(tmp_path: Path) -> None:
+    f = write(tmp_path, "settings.py", """
+        from pydantic_settings import BaseSettings
+
+        class Settings(BaseSettings):
+            token: str
+
+            @classmethod
+            def settings_customise_sources(
+                cls, settings_cls, init, env, dotenv, secrets
+            ):
+                return (custom_source,)
+    """)
+
+    usage = scan_file(f)[0]
+
+    assert usage.is_dynamic
+    assert usage.raw_expr == "model_config"
 
 
 # ============================================================== mixed

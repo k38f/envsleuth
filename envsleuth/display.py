@@ -6,8 +6,9 @@ import json
 import os
 import shlex
 import sys
+from dataclasses import replace
 from pathlib import Path
-from typing import List, Optional, TextIO
+from typing import List, Optional, Sequence, TextIO
 
 from envsleuth.checker import CheckReport
 
@@ -180,7 +181,10 @@ def render_report(report: CheckReport, use_color: bool = True, verbose: bool = F
 
         # show where it's used when verbose, or always for missing (helpful context)
         if verbose or var.status == "missing":
-            for u in var.usages[:MAX_USAGES_SHOWN]:
+            shown_usages = var.usages
+            if var.status == "missing" and not verbose:
+                shown_usages = var.missing_usages or var.usages
+            for u in shown_usages[:MAX_USAGES_SHOWN]:
                 try:
                     rel = u.file.relative_to(Path.cwd())
                 except ValueError:
@@ -188,8 +192,8 @@ def render_report(report: CheckReport, use_color: bool = True, verbose: bool = F
                 lines.append(s.dim(
                     f"     at {_display_field(rel)}:{u.line}"
                 ))
-            if len(var.usages) > MAX_USAGES_SHOWN:
-                extra = len(var.usages) - MAX_USAGES_SHOWN
+            if len(shown_usages) > MAX_USAGES_SHOWN:
+                extra = len(shown_usages) - MAX_USAGES_SHOWN
                 lines.append(s.dim(f"     ... and {extra} more"))
 
     # dynamic warnings
@@ -240,6 +244,34 @@ def render_report(report: CheckReport, use_color: bool = True, verbose: bool = F
     lines.append(summary)
 
     return "\n".join(lines)
+
+
+def render_reports(
+    reports: Sequence[CheckReport],
+    use_color: bool = True,
+    verbose: bool = False,
+) -> str:
+    """Render one or more environment profiles without repeating scan findings."""
+    if len(reports) == 1:
+        return render_report(
+            reports[0], use_color=use_color, verbose=verbose,
+        )
+
+    s = Styler(use_color)
+    chunks: List[str] = []
+    total = len(reports)
+    for index, report in enumerate(reports):
+        label = report.env_file or ".env"
+        chunks.append(s.bold(
+            f"Environment {index + 1}/{total}: {_display_field(label)}"
+        ))
+        shown = report
+        if index:
+            shown = replace(report, dynamic_usages=[], errors=[])
+        chunks.append(render_report(
+            shown, use_color=use_color, verbose=verbose,
+        ))
+    return "\n\n".join(chunks)
 
 
 def _render_summary(report: CheckReport, s: Styler) -> str:
@@ -338,7 +370,11 @@ def render_env_not_found_error(
 # ----------------------------------------------------------- github actions
 
 
-def render_report_github(report: CheckReport) -> str:
+def render_report_github(
+    report: CheckReport,
+    *,
+    emit_success: bool = True,
+) -> str:
     """Emit GitHub Actions workflow commands so missing vars show up as
     annotations in the PR/run UI, right next to the source line.
 
@@ -355,7 +391,7 @@ def render_report_github(report: CheckReport) -> str:
 
     for var in report.missing:
         # one annotation per usage so each occurrence gets pinned in the PR
-        for u in var.usages:
+        for u in var.missing_usages or var.usages:
             file_path = _gha_path(u.file)
             msg = (
                 f"Missing env var: {var.name} is used here but not defined in "
@@ -365,6 +401,15 @@ def render_report_github(report: CheckReport) -> str:
                 "error", msg, file=file_path, line=u.line,
                 title="Missing env var",
             ))
+
+    for name in report.extra_in_env:
+        env_name = report.env_file.name if report.env_file else ".env"
+        lines.append(_gha_command(
+            "notice",
+            f"Extra env var: {name} is defined in {env_name} but no "
+            "static usage was found.",
+            title="Extra env var",
+        ))
 
     # dynamic usages — warn, can't statically resolve so might be a bug
     for u in report.dynamic_usages:
@@ -391,7 +436,12 @@ def render_report_github(report: CheckReport) -> str:
     n_missing = len(report.missing)
     n_dynamic = len(report.dynamic_usages)
     n_errors = len(report.errors)
-    if n_missing == 0 and n_errors == 0 and report.env_file_exists:
+    if (
+        emit_success
+        and n_missing == 0
+        and n_errors == 0
+        and report.env_file_exists
+    ):
         if n_dynamic:
             lines.append(_gha_command(
                 "notice",
@@ -403,6 +453,34 @@ def render_report_github(report: CheckReport) -> str:
                 "notice", "envsleuth: all required env vars defined"
             ))
 
+    return "\n".join(lines)
+
+
+def render_reports_github(reports: Sequence[CheckReport]) -> str:
+    """Emit annotations for multiple environment profiles."""
+    if len(reports) == 1:
+        return render_report_github(reports[0])
+
+    lines: List[str] = []
+    shared_diagnostics = bool(
+        reports and (reports[0].errors or reports[0].dynamic_usages)
+    )
+    for index, report in enumerate(reports):
+        label = report.env_file or ".env"
+        lines.append(_gha_command(
+            "notice",
+            f"Checking environment profile {index + 1}/{len(reports)}: {label}",
+            title="Environment profile",
+        ))
+        shown = report
+        if index:
+            shown = replace(report, dynamic_usages=[], errors=[])
+        rendered = render_report_github(
+            shown,
+            emit_success=not (index and shared_diagnostics),
+        )
+        if rendered:
+            lines.append(rendered)
     return "\n".join(lines)
 
 
@@ -466,46 +544,109 @@ def render_error_github(
 
 def render_report_json(report: CheckReport) -> str:
     """Machine-readable output for CI pipelines."""
-    def _usage(u) -> dict:
-        return {
-            "file": str(u.file),
-            "line": u.line,
-            "call_type": u.call_type,
-            "has_default": u.has_default,
-        }
+    return json.dumps(_report_data(report), indent=2)
+
+
+def _usage_data(usage) -> dict:
+    data = {
+        "file": str(usage.file),
+        "line": usage.line,
+        "call_type": usage.call_type,
+        "has_default": usage.has_default,
+    }
+    accepted_names = getattr(usage, "accepted_names", ())
+    if accepted_names:
+        data["accepted_names"] = list(accepted_names)
+    case_sensitive = getattr(usage, "case_sensitive", None)
+    if case_sensitive is not None:
+        data["case_sensitive"] = case_sensitive
+    return data
+
+
+def _dynamic_usage_data(usage) -> dict:
+    return {
+        "file": str(usage.file),
+        "line": usage.line,
+        "expression": usage.raw_expr,
+        "call_type": usage.call_type,
+    }
+
+
+def _report_data(report: CheckReport, include_global: bool = True) -> dict:
+    summary = {
+        "total": len(report.variables),
+        "present": len(report.present),
+        "missing": len(report.missing),
+        "with_default": len(report.with_default),
+        "ignored": len(report.ignored),
+        "dynamic": len(report.dynamic_usages),
+        "errors": len(report.errors),
+    }
+    if not include_global:
+        summary.pop("dynamic")
+        summary.pop("errors")
 
     data = {
         "env_file": str(report.env_file) if report.env_file else None,
         "env_file_exists": report.env_file_exists,
-        "ignore_patterns": list(report.ignore_patterns),
-        "summary": {
-            "total": len(report.variables),
-            "present": len(report.present),
-            "missing": len(report.missing),
-            "with_default": len(report.with_default),
-            "ignored": len(report.ignored),
-            "dynamic": len(report.dynamic_usages),
-            "errors": len(report.errors),
-        },
+        "ignore_pattern_count": len(report.ignore_patterns),
+        "summary": summary,
         "variables": [
             {
                 "name": v.name,
                 "status": v.status,
-                "usages": [_usage(u) for u in v.usages],
+                "usages": [_usage_data(u) for u in v.usages],
             }
             for v in report.variables
         ],
-        "dynamic_usages": [
-            {
-                "file": str(u.file),
-                "line": u.line,
-                "expression": u.raw_expr,
-                "call_type": u.call_type,
-            }
-            for u in report.dynamic_usages
-        ],
         "extra_in_env": report.extra_in_env,
-        "errors": [{"file": str(p), "error": m} for p, m in report.errors],
+    }
+    if include_global:
+        data["dynamic_usages"] = [
+            _dynamic_usage_data(usage) for usage in report.dynamic_usages
+        ]
+        data["errors"] = [
+            {"file": str(path), "error": message}
+            for path, message in report.errors
+        ]
+    return data
+
+
+def render_reports_json(reports: Sequence[CheckReport]) -> str:
+    """Machine-readable aggregate for multiple independent env files."""
+    if len(reports) == 1:
+        return render_report_json(reports[0])
+
+    first = reports[0] if reports else CheckReport()
+    data = {
+        "env_files": [
+            str(report.env_file) if report.env_file else None
+            for report in reports
+        ],
+        "summary": {
+            "environments": len(reports),
+            "total": sum(len(report.variables) for report in reports),
+            "present": sum(len(report.present) for report in reports),
+            "missing": sum(len(report.missing) for report in reports),
+            "with_default": sum(
+                len(report.with_default) for report in reports
+            ),
+            "ignored": sum(len(report.ignored) for report in reports),
+            "extra": sum(len(report.extra_in_env) for report in reports),
+            "dynamic": len(first.dynamic_usages),
+            "errors": len(first.errors),
+        },
+        "reports": [
+            _report_data(report, include_global=False)
+            for report in reports
+        ],
+        "dynamic_usages": [
+            _dynamic_usage_data(usage) for usage in first.dynamic_usages
+        ],
+        "errors": [
+            {"file": str(path), "error": message}
+            for path, message in first.errors
+        ],
     }
     return json.dumps(data, indent=2)
 

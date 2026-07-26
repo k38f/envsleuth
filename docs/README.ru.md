@@ -9,15 +9,19 @@
 [![python](https://img.shields.io/pypi/pyversions/envsleuth.svg)](https://pypi.org/project/envsleuth/)
 [![license](https://img.shields.io/pypi/l/envsleuth.svg)](../LICENSE)
 
-`envsleuth` разбирает Python-код через AST, находит чтение переменных через
-`os.getenv()`, `os.environ[]` и `os.environ.get()`, затем сверяет их с `.env`.
+`envsleuth` разбирает Python-код через AST, находит обращения к окружению через
+стандартную библиотеку, pydantic-settings, django-environ и python-decouple,
+затем сверяет их с одним или несколькими `.env`. Проверяемый проект при этом
+не импортируется и не выполняется.
 
 ![Демонстрация envsleuth](../demo.gif)
 
 ## Установка
 
+Требуется Python 3.10 или новее.
+
 ```bash
-pip install envsleuth
+python -m pip install envsleuth
 ```
 
 ## Использование
@@ -29,14 +33,21 @@ envsleuth scan
 # указать папку и env-файл
 envsleuth scan --path ./src --env .env.production
 
+# независимо проверить несколько профилей за одно сканирование
+envsleuth scan --env .env.development --env .env.production
+
 # режим CI — код выхода 1, если чего-то не хватает
 envsleuth scan --strict
+
+# отдельно выбрать категории, на которых CI должен падать
+envsleuth scan --fail-on missing --fail-on dynamic
 
 # создать .env.example по коду
 envsleuth generate
 
-# машиночитаемый вывод
+# JSON или SARIF 2.1.0
 envsleuth scan --json
+envsleuth scan --output sarif > envsleuth.sarif
 ```
 
 ### Пример вывода
@@ -88,6 +99,36 @@ c = sys_os.getenv("C")
 
 Переменные, имена которых вычисляются во время выполнения (например, `os.getenv(f"PREFIX_{x}")`), нельзя проверить статически. Они выводятся в отдельном блоке предупреждений.
 
+### Pydantic settings
+
+Классы `BaseSettings` анализируются статически, поэтому Pydantic не становится
+зависимостью envsleuth:
+
+```python
+from pydantic import AliasChoices, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="APP_")
+
+    database_url: str
+    timeout: int = 10
+    token: str = Field(
+        validation_alias=AliasChoices("TOKEN", "LEGACY_TOKEN")
+    )
+```
+
+Поддерживаются литеральный `env_prefix`, `env_prefix_target`, `alias`,
+`validation_alias`, `AliasChoices`, обычные значения по умолчанию,
+`default_factory` и локальное наследование settings-классов. Вычисляемые
+конфиги, распаковки и генераторы alias не угадываются, а показываются как
+динамические обращения.
+
+Пользовательские settings sources, runtime-переопределения `_env_prefix` и
+`_case_sensitive`, наследование между модулями и разворачивание nested
+delimiter нельзя доказать по AST одного модуля — такие случаи нужно проверить
+вручную.
+
 ### Django и библиотеки конфигурации
 
 Также поддерживаются django-environ и python-decouple:
@@ -127,6 +168,26 @@ DEBUG = config('DEBUG', default=False, cast=bool)
 
 Каждая отсутствующая переменная становится аннотацией `::error`, а динамические обращения — `::warning`. Формат соответствует [спецификации workflow commands](https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions) GitHub.
 
+Для GitHub Code Scanning можно сформировать SARIF:
+
+```yaml
+permissions:
+  contents: read
+  security-events: write
+
+steps:
+  - name: Analyze environment configuration
+    run: envsleuth scan --output sarif --fail-on missing > envsleuth.sarif
+
+  - uses: github/codeql-action/upload-sarif@v4
+    if: always()
+    with:
+      sarif_file: envsleuth.sarif
+```
+
+SARIF детерминирован, использует стабильные идентификаторы правил и никогда не
+включает значения из `.env`.
+
 ## pre-commit hook
 
 Добавьте envsleuth в `.pre-commit-config.yaml`:
@@ -134,7 +195,7 @@ DEBUG = config('DEBUG', default=False, cast=bool)
 ```yaml
 repos:
   - repo: https://github.com/k38f/envsleuth
-    rev: v0.3.1
+    rev: v1.0.0
     hooks:
       - id: envsleuth
         # необязательные переопределения
@@ -195,50 +256,79 @@ DEBUG_TOOL
 
 Это подходит для переменных из CI, Docker или shell-конфига, которых нет в локальном `.env`.
 
+## Конфигурация проекта
+
+Общие параметры можно хранить в ближайшем `pyproject.toml`:
+
+```toml
+[tool.envsleuth]
+path = "src"
+env = [".env.development", ".env.production"]
+envignore = ".envignore"
+fail-on = ["missing", "dynamic"]
+exclude = ["vendor", "generated"]
+extensions = [".pyi"]
+```
+
+Пути из таблицы считаются от `pyproject.toml`. Для безопасности пути в
+автоматически найденном конфиге не могут выходить из его каталога; явно
+выбранный `--config FILE` разрешает такие внешние пути осознанно. Переданные
+через CLI пути считаются от текущей папки и имеют приоритет. `--no-config`
+отключает поиск. Неизвестные ключи и неверные типы завершают команду с ошибкой,
+поэтому опечатки не игнорируются молча.
+
+`--strict` по-прежнему равен политике `--fail-on missing`. `--no-fail-on`
+очищает только список `fail-on`; чтобы также отменить `strict = true`, передайте
+`--no-strict`.
+
 ## Справочник CLI
 
 ### `envsleuth scan`
 
 | Флаг | Описание |
 | --- | --- |
-| `--path`, `-p` | Папка или файл для сканирования. По умолчанию: `.` |
-| `--env` | Путь к файлу `.env`. По умолчанию: `./.env` |
+| `--path`, `-p` | Папка или файл. По умолчанию: корень конфига либо `.` |
+| `--env` | Env-файл; можно повторять для независимых профилей |
 | `--envignore` | Путь к `.envignore`. По умолчанию: `./.envignore`, если файл есть |
-| `--strict` | Выйти с кодом 1, если есть отсутствующие переменные |
-| `--output`, `-o` | `text` (по умолчанию), `json` или `github` (аннотации Actions) |
+| `--strict`, `--no-strict` | Включить/выключить ошибку на missing |
+| `--fail-on CATEGORY` | Ошибка на `missing`, `extra` или `dynamic`; можно повторять |
+| `--no-fail-on` | Очистить список `fail-on` из конфигурации |
+| `--output`, `-o` | `text`, `json`, `github` или `sarif` |
 | `--json` | Псевдоним `--output json`, сохранённый для обратной совместимости |
 | `--no-color` | Отключить ANSI-цвета; также учитывает `NO_COLOR` |
 | `--exclude DIR` | Дополнительное имя папки, которую нужно пропустить. Можно повторять |
 | `--ext .EXT` | Дополнительное расширение файлов, например `.pyi`. Можно повторять |
 | `--verbose`, `-v` | Показать места использования каждой переменной |
 | `--no-update-check` | Пропустить еженедельную проверку версии на PyPI |
+| `--config FILE`, `--no-config` | Выбрать или отключить TOML-конфиг |
 
 ### `envsleuth generate`
 
 | Флаг | Описание |
 | --- | --- |
-| `--path`, `-p` | Папка или файл для сканирования. По умолчанию: `.` |
+| `--path`, `-p` | Папка или файл. По умолчанию: путь/корень конфига либо `.` |
 | `--output`, `-o` | Куда записать файл. По умолчанию: `./.env.example` |
 | `--force`, `-f` | Перезаписать существующий файл |
 | `--no-color` | Отключить ANSI-цвета в сообщении об успехе |
 | `--exclude`, `--ext` | То же, что в `scan` |
 | `--no-update-check` | Пропустить еженедельную проверку версии на PyPI |
+| `--config FILE`, `--no-config` | Выбрать или отключить конфиг проекта |
 
 ### Коды выхода
 
 - `0` — команда выполнена успешно.
-- `1` — `scan --strict` нашёл обязательные переменные, которых нет в существующем `.env`.
+- `1` — найдена категория, выбранная через `--strict` или `--fail-on`.
 - `2` — операционная ошибка: например, отсутствует `.env`, сканирование
-  завершилось не полностью, указан неверный путь или произошла ошибка
-  чтения, записи либо генерации. JSON-режим и вывод для GitHub по возможности
-  сначала возвращают структурированный отчёт об ошибке.
+  завершилось не полностью, неверен конфиг или путь, произошла ошибка чтения,
+  записи либо генерации. JSON, GitHub и SARIF по возможности возвращают один
+  корректный структурированный документ.
 
 ## Уведомления об обновлениях
 
 envsleuth не чаще раза в неделю проверяет наличие новых выпусков на PyPI. Если новая версия есть, в stderr выводится одна строка:
 
 ```
-ℹ  envsleuth 0.3.1 is available (you have 0.3.0). Run: python -m pip install --upgrade envsleuth
+ℹ  envsleuth 1.0.1 is available (you have 1.0.0). Run: python -m pip install --upgrade envsleuth
 ```
 
 Результат кэшируется, запрос имеет короткий тайм-аут, а при любой ошибке (нет сети, доступ заблокирован и т. д.) проверка молча завершается. Чтобы полностью её отключить:
@@ -272,8 +362,10 @@ dotenv-linter проверяет `.env`, а python-decouple читает кон�
 - [python-dotenv](https://github.com/theskumar/python-dotenv) — разбор `.env`
 - [flashbar](https://github.com/k38f/flashbar) — индикатор прогресса при сканировании 20+ файлов
 - [packaging](https://packaging.pypa.io/) — сравнение версий по PEP 440 при проверке обновлений
+- [tomli](https://github.com/hukkin/tomli) — единый TOML-парсер для всех поддерживаемых версий Python
 
-Сам сканер использует только стандартную библиотеку Python (`ast`).
+Сам сканер использует только стандартную библиотеку Python (`ast`); Pydantic,
+django-environ и python-decouple распознаются без установки.
 
 ## Лицензия
 

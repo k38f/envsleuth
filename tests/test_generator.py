@@ -294,6 +294,45 @@ def test_case_collision_message_order_is_stable(monkeypatch) -> None:
     ]
 
 
+def test_pydantic_case_insensitive_names_collide_even_on_posix(
+    monkeypatch,
+) -> None:
+    upper = EnvUsage(
+        name="TOKEN",
+        file=Path("settings.py"),
+        line=3,
+        case_sensitive=False,
+    )
+    lower = EnvUsage(
+        name="token",
+        file=Path("settings.py"),
+        line=4,
+        case_sensitive=False,
+    )
+    monkeypatch.setattr(
+        "envsleuth.generator._env_names_case_sensitive", lambda: True,
+    )
+
+    with pytest.raises(EnvNameCollisionError):
+        build_env_example(ScanResult(usages=[upper, lower]))
+
+
+def test_alias_choices_are_explained_but_only_primary_is_generated() -> None:
+    usage = EnvUsage(
+        name="TOKEN",
+        file=Path("settings.py"),
+        line=3,
+        accepted_names=("TOKEN", "LEGACY_TOKEN"),
+        case_sensitive=False,
+    )
+
+    out = build_env_example(ScanResult(usages=[usage]))
+
+    assert "# also accepts: LEGACY_TOKEN" in out
+    assert "\nTOKEN=\n" in out
+    assert "\nLEGACY_TOKEN=" not in out
+
+
 def test_scan_errors_fail_before_force_overwrite(tmp_path: Path) -> None:
     target = tmp_path / ".env.example"
     target.write_text("keep me\n", encoding="utf-8")
@@ -551,6 +590,22 @@ def test_huge_integer_default_does_not_crash_generation() -> None:
     out = build_env_example(ScanResult(usages=[usage]))
 
     assert "HUGE=\n" in out
+    assert "default omitted" in out
+
+
+def test_pydantic_default_factory_gets_omission_note() -> None:
+    usage = EnvUsage(
+        name="GENERATED",
+        file=Path("settings.py"),
+        line=1,
+        has_default=True,
+        default_node=None,
+        call_type="pydantic_settings",
+    )
+
+    out = build_env_example(ScanResult(usages=[usage]))
+
+    assert "GENERATED=\n" in out
     assert "default omitted" in out
 
 

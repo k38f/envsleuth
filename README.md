@@ -9,9 +9,10 @@
 [![python](https://img.shields.io/pypi/pyversions/envsleuth.svg)](https://pypi.org/project/envsleuth/)
 [![license](https://img.shields.io/pypi/l/envsleuth.svg)](https://github.com/k38f/envsleuth/blob/main/LICENSE)
 
-`envsleuth` parses Python source code with AST, finds reads through
-`os.getenv()`, `os.environ[]`, and `os.environ.get()`, then reports variables
-that are missing from `.env`.
+`envsleuth` parses Python source code with AST, finds environment reads through
+the standard library, pydantic-settings, django-environ, and python-decouple,
+then compares them with one or more `.env` files. It never imports or executes
+the project being inspected.
 
 
 ![envsleuth demo](https://raw.githubusercontent.com/k38f/envsleuth/main/demo.gif)
@@ -19,8 +20,10 @@ that are missing from `.env`.
 
 ## Install
 
+Python 3.10 or newer is required.
+
 ```bash
-pip install envsleuth
+python -m pip install envsleuth
 ```
 
 ## Usage
@@ -32,14 +35,21 @@ envsleuth scan
 # specific directory, specific env file
 envsleuth scan --path ./src --env .env.production
 
+# check several independent deployment profiles with one source scan
+envsleuth scan --env .env.development --env .env.production
+
 # CI mode — exits 1 if anything is missing
 envsleuth scan --strict
+
+# choose exactly which findings fail CI
+envsleuth scan --fail-on missing --fail-on dynamic
 
 # generate a .env.example from your code
 envsleuth generate
 
-# machine-readable output
+# machine-readable JSON or SARIF 2.1.0
 envsleuth scan --json
+envsleuth scan --output sarif > envsleuth.sarif
 ```
 
 ### Example output
@@ -91,6 +101,36 @@ c = sys_os.getenv("C")
 
 Variables with names computed at runtime (e.g. `os.getenv(f"PREFIX_{x}")`) can't be checked statically — they're reported in a separate warning section so you know they exist.
 
+### Pydantic settings
+
+`BaseSettings` declarations are analyzed without adding Pydantic as a runtime
+dependency:
+
+```python
+from pydantic import AliasChoices, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="APP_")
+
+    database_url: str
+    timeout: int = 10
+    token: str = Field(
+        validation_alias=AliasChoices("TOKEN", "LEGACY_TOKEN")
+    )
+```
+
+This finds `APP_database_url`, treats `APP_timeout` as defaulted, and accepts
+either `TOKEN` or `LEGACY_TOKEN` for the final field. Literal prefixes,
+`env_prefix_target`, `alias`, `validation_alias`, `AliasChoices`, defaults,
+`default_factory`, and local settings-class inheritance are supported.
+Computed config, unpacking, and alias generators are reported as dynamic
+instead of guessed.
+
+Custom settings sources, runtime `_env_prefix`/`_case_sensitive` overrides,
+cross-module inheritance, and nested-delimiter expansion cannot be proven from
+one module's AST. Review those dynamic or framework-specific cases manually.
+
 ### Django and config libraries
 
 envsleuth also understands the two most common third-party config patterns:
@@ -132,6 +172,26 @@ Each missing var becomes an `::error` annotation; dynamic lookups become
 `::warning`. The format follows GitHub's [workflow command
 spec](https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions).
 
+For code-scanning upload workflows, use SARIF:
+
+```yaml
+permissions:
+  contents: read
+  security-events: write
+
+steps:
+  - name: Analyze environment configuration
+    run: envsleuth scan --output sarif --fail-on missing > envsleuth.sarif
+
+  - uses: github/codeql-action/upload-sarif@v4
+    if: always()
+    with:
+      sarif_file: envsleuth.sarif
+```
+
+SARIF output is deterministic, has stable rule IDs, and never embeds `.env`
+values or source snippets.
+
 ## pre-commit hook
 
 Add envsleuth to your `.pre-commit-config.yaml`:
@@ -139,7 +199,7 @@ Add envsleuth to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/k38f/envsleuth
-    rev: v0.3.1
+    rev: v1.0.0
     hooks:
       - id: envsleuth
         # optional overrides
@@ -198,49 +258,79 @@ DEBUG_TOOL
 
 Great for vars that come from CI, Docker, or your shell rc files rather than the local `.env`.
 
+## Project configuration
+
+Put shared defaults in the nearest `pyproject.toml`:
+
+```toml
+[tool.envsleuth]
+path = "src"
+env = [".env.development", ".env.production"]
+envignore = ".envignore"
+fail-on = ["missing", "dynamic"]
+exclude = ["vendor", "generated"]
+extensions = [".pyi"]
+```
+
+Config paths are relative to `pyproject.toml`. For safety, paths in an
+auto-discovered config must stay inside its directory; an explicitly selected
+`--config path/to/file.toml` may opt in to external paths. Explicit CLI paths
+are relative to the current directory and take precedence. A CLI `--env` list
+or `--fail-on` list replaces the configured list; `--exclude` and `--ext`
+extend it. Use `--no-config` to disable discovery. Unknown keys and invalid
+types are errors rather than silently ignored typos.
+
+`--strict` remains equivalent to adding `missing` to the fail policy.
+`--no-strict` can override `strict = true`, while `--no-fail-on` clears only
+the configured `fail-on` list. Use both flags to clear both policies.
+
 ## CLI reference
 
 ### `envsleuth scan`
 
 | Flag | Description |
 | --- | --- |
-| `--path`, `-p` | Directory or file to scan. Default: `.` |
-| `--env` | Path to `.env` file. Default: `./.env` |
+| `--path`, `-p` | Directory or file to scan. Default: config root or `.` |
+| `--env` | Env file to check. Repeat for independent profiles |
 | `--envignore` | Path to `.envignore`. Default: `./.envignore` if present |
-| `--strict` | Exit with code 1 if vars are missing |
-| `--output`, `-o` | `text` (default), `json`, or `github` (Actions annotations) |
+| `--strict`, `--no-strict` | Enable/disable failure on missing variables |
+| `--fail-on CATEGORY` | Fail on `missing`, `extra`, or `dynamic`; repeatable |
+| `--no-fail-on` | Clear the configured `fail-on` list |
+| `--output`, `-o` | `text`, `json`, `github`, or `sarif` |
 | `--json` | Alias for `--output json` (kept for backwards compat) |
 | `--no-color` | Disable ANSI colors (also honours `NO_COLOR` env var) |
 | `--exclude DIR` | Extra directory name to skip. Can be repeated |
 | `--ext .EXT` | Extra file extension to scan (e.g. `.pyi`). Can be repeated |
 | `--verbose`, `-v` | Show usage locations for every variable |
 | `--no-update-check` | Skip the weekly PyPI version check |
+| `--config FILE`, `--no-config` | Select or disable `pyproject.toml` config |
 
 ### `envsleuth generate`
 
 | Flag | Description |
 | --- | --- |
-| `--path`, `-p` | Directory or file to scan. Default: `.` |
+| `--path`, `-p` | Directory or file to scan. Default: config path/root or `.` |
 | `--output`, `-o` | Where to write. Default: `./.env.example` |
 | `--force`, `-f` | Overwrite existing output file |
 | `--no-color` | Disable ANSI colors in the success message |
 | `--exclude`, `--ext` | Same as in `scan` |
 | `--no-update-check` | Skip the weekly PyPI version check |
+| `--config FILE`, `--no-config` | Select or disable project config |
 
 ### Exit codes
 
 - `0` — the command completed successfully.
-- `1` — `scan --strict` found required variables missing from an existing `.env`.
+- `1` — a category selected by `--strict` or `--fail-on` was found.
 - `2` — an operational failure, such as a missing `.env`, an incomplete scan,
-  an invalid path, or a read/write/generation error. JSON and GitHub output still
-  emit a structured error report first when possible.
+  invalid config/path, or a read/write/generation error. JSON, GitHub, and
+  SARIF output still emit one structured error document when possible.
 
 ## Update notifications
 
 envsleuth checks PyPI for new releases at most once per week. When a new version is available, it prints a single line to stderr:
 
 ```
-ℹ  envsleuth 0.3.1 is available (you have 0.3.0). Run: python -m pip install --upgrade envsleuth
+ℹ  envsleuth 1.0.1 is available (you have 1.0.0). Run: python -m pip install --upgrade envsleuth
 ```
 
 The check is cached, runs with a short timeout, and stays silent on any error (offline, blocked network, etc). To disable it entirely:
@@ -275,8 +365,11 @@ runtime.
 - [python-dotenv](https://github.com/theskumar/python-dotenv) — `.env` parsing
 - [flashbar](https://github.com/k38f/flashbar) — progress bar used when scanning 20+ files
 - [packaging](https://packaging.pypa.io/) — PEP 440 version comparison for update checks
+- [tomli](https://github.com/hukkin/tomli) — consistent TOML parsing on every supported Python version
 
-The scanner itself uses only the Python standard library (`ast`).
+The scanner itself uses only the Python standard library (`ast`); Pydantic,
+django-environ, and python-decouple are recognized statically and are not
+installed by envsleuth.
 
 ## License
 

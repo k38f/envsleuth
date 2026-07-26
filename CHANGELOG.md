@@ -1,5 +1,62 @@
 # Changelog
 
+## 1.0.0 - 2026-07-26
+
+First stable release.
+
+### Configuration and CI
+
+- Added safe, nearest-project discovery of `[tool.envsleuth]` in
+  `pyproject.toml`, with `--config` and `--no-config` overrides. Paths from the
+  table resolve relative to the config file. Auto-discovered paths are confined
+  to that project root, while explicit config and CLI paths remain opt-in
+  escape hatches.
+- `--env` is repeatable. Multiple env files are checked independently after
+  one source scan, so development, test, and production profiles cannot mask
+  one another.
+- Added repeatable `--fail-on missing|extra|dynamic` policies.
+  `--strict` remains fully supported as the backwards-compatible spelling for
+  `--fail-on missing`.
+- Added deterministic SARIF 2.1.0 output for code-scanning integrations.
+  Missing, extra, dynamic, scan, and operational findings use stable rule IDs,
+  safe repository-relative URIs, bounded messages, and a 25,000-result limit.
+- Multi-profile text, JSON, and GitHub Actions output identifies the selected
+  environment without repeating global scan diagnostics.
+
+### Scanner
+
+- Added static support for `pydantic-settings` v2 `BaseSettings` classes,
+  including aliased imports, `SettingsConfigDict(env_prefix=...)`, class
+  config keywords, required/default fields, `Field(alias=...)`,
+  `Field(validation_alias=...)`, `AliasChoices`, `env_prefix_target`, and
+  local inheritance with subclass config overrides.
+- Pydantic's default case-insensitive environment matching and one-of alias
+  behavior are represented explicitly instead of treating alternative names
+  as separate required variables.
+- Pydantic and inspected application modules are never imported or executed;
+  computed prefixes, unpacked config, and alias generators remain visible as
+  dynamic findings.
+
+### Hardening and compatibility
+
+- Config, `.env`, and `.envignore` inputs must be regular UTF-8 files and have
+  bounded sizes and entry counts. Scans also cap source-file and usage counts.
+  Invalid types, unknown config keys, excessive profiles or bindings, malformed
+  TOML/dotenv syntax, control characters, and unsafe extensions fail with
+  redacted code-2 errors.
+- Machine output reports only the number of active ignore patterns, not their
+  raw contents, so a misconfigured ignore path cannot echo file data into CI.
+- Operational errors continue to take precedence over lint policies, and every
+  machine format remains a single valid document even when the command exits
+  nonzero.
+- Direct, build, development, and release-tool dependencies are restricted to
+  tested major/minor branches while allowing patch updates. The same `tomli`
+  parser is used on every supported Python version so config behavior does not
+  drift across the CI matrix.
+- The minimum supported version is now Python 3.10. Python 3.10 through 3.14
+  and Windows remain in the CI matrix, allowing current dependency branches
+  without per-interpreter dependency splits.
+
 ## 0.3.1 - 2026-07-21
 
 Patch release focused on predictable dependency updates.

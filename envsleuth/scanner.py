@@ -14,7 +14,7 @@ import stat
 import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 
 @dataclass
@@ -41,6 +41,12 @@ class EnvUsage:
 
     default_node: Optional[ast.AST] = None
     """AST node for an explicitly supplied or declared default value."""
+
+    accepted_names: Tuple[str, ...] = ()
+    """All accepted names when one field can read several env variables."""
+
+    case_sensitive: Optional[bool] = None
+    """None uses platform matching; Pydantic settings provide an explicit mode."""
 
     @property
     def is_dynamic(self) -> bool:
@@ -124,6 +130,12 @@ _ALIAS_KINDS = (
     "environ_env_class",
     "environ_env",
     "decouple_config",
+    "pydantic_settings_mod",
+    "pydantic_mod",
+    "pydantic_settings_base",
+    "pydantic_settings_config",
+    "pydantic_field",
+    "pydantic_alias_choices",
 )
 _MAX_FLOW_PASSES = 32
 
@@ -135,7 +147,41 @@ class _EnvironConfig:
     prefix: Optional[str] = ""
 
 
-_Binding = Tuple[str, Optional[_EnvironConfig]]
+@dataclass
+class _PydanticField:
+    node: ast.AnnAssign
+    field_name: str
+    alias_names: Optional[Tuple[str, ...]]
+    raw_alias: Optional[str]
+    has_default: bool
+    default_node: Optional[ast.AST]
+
+
+@dataclass
+class _PydanticSettingsConfig:
+    # None means the value is computed dynamically.
+    prefix: Optional[str] = ""
+    prefix_target: Optional[str] = "variable"
+    case_sensitive: Optional[bool] = False
+    aliases_dynamic: bool = False
+    fields: Tuple[_PydanticField, ...] = ()
+
+    def __deepcopy__(self, memo: dict) -> "_PydanticSettingsConfig":
+        clone = _PydanticSettingsConfig(
+            prefix=self.prefix,
+            prefix_target=self.prefix_target,
+            case_sensitive=self.case_sensitive,
+            aliases_dynamic=self.aliases_dynamic,
+            # Field nodes are immutable scanner input. Copying whole AST
+            # subtrees on every control-flow branch gets expensive quickly.
+            fields=self.fields,
+        )
+        memo[id(self)] = clone
+        return clone
+
+
+_BindingConfig = Union[_EnvironConfig, _PydanticSettingsConfig]
+_Binding = Tuple[str, Optional[_BindingConfig]]
 
 
 class _FunctionBindingCollector(ast.NodeVisitor):
@@ -271,18 +317,14 @@ class _EnvVisitor(ast.NodeVisitor):
 
     @staticmethod
     def _fresh_scope(kind: str) -> dict:
-        return {
+        scope = {
             "kind": kind,
-            "os": set(),
-            "getenv": set(),
-            "environ": set(),
-            "django_environ_mod": set(),
-            "environ_env_class": set(),
-            "environ_env": set(),
-            "decouple_config": set(),
             "shadowed": set(),
             "environ_configs": {},
+            "pydantic_configs": {},
         }
+        scope.update({alias_kind: set() for alias_kind in _ALIAS_KINDS})
+        return scope
 
     def _push_scope(self, kind: str) -> None:
         self.scopes.append(self._fresh_scope(kind))
@@ -330,7 +372,7 @@ class _EnvVisitor(ast.NodeVisitor):
         self,
         name: str,
         kind: Optional[str],
-        config: Optional[_EnvironConfig] = None,
+        config: Optional[_BindingConfig] = None,
         scope_index: int = -1,
     ) -> None:
         scope = self.scopes[scope_index]
@@ -338,13 +380,22 @@ class _EnvVisitor(ast.NodeVisitor):
             scope[alias_kind].discard(name)
         scope["shadowed"].discard(name)
         scope["environ_configs"].pop(name, None)
+        scope["pydantic_configs"].pop(name, None)
 
         if kind is None:
             scope["shadowed"].add(name)
         else:
             scope[kind].add(name)
             if kind == "environ_env":
-                scope["environ_configs"][name] = config or _EnvironConfig()
+                scope["environ_configs"][name] = (
+                    config if isinstance(config, _EnvironConfig)
+                    else _EnvironConfig()
+                )
+            elif kind == "pydantic_settings_base":
+                scope["pydantic_configs"][name] = (
+                    config if isinstance(config, _PydanticSettingsConfig)
+                    else _PydanticSettingsConfig()
+                )
 
     def _bind_options(
         self,
@@ -373,6 +424,7 @@ class _EnvVisitor(ast.NodeVisitor):
             scope[alias_kind].discard(name)
         scope["shadowed"].discard(name)
         scope["environ_configs"].pop(name, None)
+        scope["pydantic_configs"].pop(name, None)
 
         for kind, _ in unique:
             scope[kind].add(name)
@@ -386,6 +438,23 @@ class _EnvVisitor(ast.NodeVisitor):
                 scope["environ_configs"][name] = unique_configs[0]
             else:
                 scope["environ_configs"][name] = self._combine_configs(unique_configs)
+        pydantic_configs = [
+            config for kind, config in unique
+            if (
+                kind == "pydantic_settings_base"
+                and isinstance(config, _PydanticSettingsConfig)
+            )
+        ]
+        if pydantic_configs:
+            unique_configs = list(
+                {id(config): config for config in pydantic_configs}.values()
+            )
+            if len(unique_configs) == 1:
+                scope["pydantic_configs"][name] = unique_configs[0]
+            else:
+                scope["pydantic_configs"][name] = (
+                    self._combine_pydantic_configs(unique_configs)
+                )
 
     def _env_config(self, name: str) -> Optional[_EnvironConfig]:
         for scope in self._visible_scopes():
@@ -393,6 +462,20 @@ class _EnvVisitor(ast.NodeVisitor):
                 return None
             if name in scope["environ_env"]:
                 return scope["environ_configs"].get(name, _EnvironConfig())
+            if any(name in scope[kind] for kind in _ALIAS_KINDS):
+                return None
+        return None
+
+    def _pydantic_config(
+        self, name: str
+    ) -> Optional[_PydanticSettingsConfig]:
+        for scope in self._visible_scopes():
+            if name in scope["shadowed"]:
+                return None
+            if name in scope["pydantic_settings_base"]:
+                return scope["pydantic_configs"].get(
+                    name, _PydanticSettingsConfig()
+                )
             if any(name in scope[kind] for kind in _ALIAS_KINDS):
                 return None
         return None
@@ -412,6 +495,61 @@ class _EnvVisitor(ast.NodeVisitor):
             common_keys.intersection_update(config.scheme)
         scheme = {key: configs[0].scheme[key] for key in common_keys}
         return _EnvironConfig(scheme=scheme, prefix=prefix)
+
+    @staticmethod
+    def _combine_pydantic_configs(
+        configs: List[_PydanticSettingsConfig],
+    ) -> _PydanticSettingsConfig:
+        if not configs:
+            return _PydanticSettingsConfig()
+        prefixes = {config.prefix for config in configs}
+        prefix_targets = {config.prefix_target for config in configs}
+        case_modes = {config.case_sensitive for config in configs}
+        fields: List[_PydanticField] = []
+        field_keys: Set[Tuple[object, ...]] = set()
+        for config in configs:
+            for field_info in config.fields:
+                key = _pydantic_field_key(field_info)
+                if key not in field_keys:
+                    field_keys.add(key)
+                    fields.append(field_info)
+        return _PydanticSettingsConfig(
+            prefix=next(iter(prefixes)) if len(prefixes) == 1 else None,
+            prefix_target=(
+                next(iter(prefix_targets))
+                if len(prefix_targets) == 1 else None
+            ),
+            case_sensitive=(
+                next(iter(case_modes)) if len(case_modes) == 1 else None
+            ),
+            aliases_dynamic=any(config.aliases_dynamic for config in configs),
+            fields=tuple(fields),
+        )
+
+    @staticmethod
+    def _inherit_pydantic_configs(
+        configs: List[_PydanticSettingsConfig],
+    ) -> _PydanticSettingsConfig:
+        if not configs:
+            return _PydanticSettingsConfig()
+
+        # BaseSettings carries its settings defaults in model_config, so the
+        # rightmost base replaces those values as well as direct overrides.
+        config = configs[-1]
+        fields_by_name: Dict[str, _PydanticField] = {}
+        order: List[str] = []
+        for base_config in reversed(configs):
+            for field_info in base_config.fields:
+                if field_info.field_name not in fields_by_name:
+                    order.append(field_info.field_name)
+                fields_by_name[field_info.field_name] = field_info
+        return _PydanticSettingsConfig(
+            prefix=config.prefix,
+            prefix_target=config.prefix_target,
+            case_sensitive=config.case_sensitive,
+            aliases_dynamic=config.aliases_dynamic,
+            fields=tuple(fields_by_name[name] for name in order),
+        )
 
     @staticmethod
     def _scopes_key(scopes: List[dict]) -> Tuple[object, ...]:
@@ -439,12 +577,36 @@ class _EnvVisitor(ast.NodeVisitor):
                 configs.append(
                     (names_key, config.prefix is None, config.prefix or "", scheme)
                 )
+            pydantic_config_groups: Dict[int, List[str]] = {}
+            for name in scope["pydantic_settings_base"]:
+                config = scope["pydantic_configs"].get(name)
+                if config is not None:
+                    pydantic_config_groups.setdefault(id(config), []).append(name)
+
+            pydantic_configs = []
+            for names in pydantic_config_groups.values():
+                names_key = tuple(sorted(names))
+                config = scope["pydantic_configs"][names_key[0]]
+                pydantic_configs.append(
+                    (
+                        names_key,
+                        config.prefix,
+                        config.prefix_target,
+                        config.case_sensitive,
+                        config.aliases_dynamic,
+                        tuple(
+                            _pydantic_field_key(field_info)
+                            for field_info in config.fields
+                        ),
+                    )
+                )
             result.append(
                 (
                     scope["kind"],
                     aliases,
                     tuple(sorted(scope["shadowed"])),
                     tuple(sorted(configs)),
+                    tuple(sorted(pydantic_configs)),
                 )
             )
         return tuple(result)
@@ -494,6 +656,40 @@ class _EnvVisitor(ast.NodeVisitor):
                     config = self._combine_configs(present)
                 config_cache[signature] = config
                 merged["environ_configs"][name] = config
+
+            pydantic_cache: Dict[
+                Tuple[Optional[int], ...], _PydanticSettingsConfig
+            ] = {}
+            for name in merged["pydantic_settings_base"]:
+                configs = [
+                    scope["pydantic_configs"].get(name)
+                    if name in scope["pydantic_settings_base"] else None
+                    for scope in branch_scopes
+                ]
+                signature = tuple(
+                    id(config) if config is not None else None
+                    for config in configs
+                )
+                if signature in pydantic_cache:
+                    merged["pydantic_configs"][name] = pydantic_cache[signature]
+                    continue
+
+                present = [
+                    config for config in configs
+                    if isinstance(config, _PydanticSettingsConfig)
+                ]
+                if len(present) != len(configs):
+                    config = _PydanticSettingsConfig(
+                        prefix=None,
+                        prefix_target=None,
+                        case_sensitive=None,
+                        aliases_dynamic=True,
+                        fields=self._combine_pydantic_configs(present).fields,
+                    )
+                else:
+                    config = self._combine_pydantic_configs(present)
+                pydantic_cache[signature] = config
+                merged["pydantic_configs"][name] = config
 
             merged_scopes.append(merged)
 
@@ -549,7 +745,21 @@ class _EnvVisitor(ast.NodeVisitor):
             self.scopes = copy.deepcopy(possible)
             for name in sorted(widen_names):
                 bindings: List[_Binding] = [
-                    (kind, _EnvironConfig(prefix=None) if kind == "environ_env" else None)
+                    (
+                        kind,
+                        _EnvironConfig(prefix=None)
+                        if kind == "environ_env"
+                        else (
+                            _PydanticSettingsConfig(
+                                prefix=None,
+                                prefix_target=None,
+                                case_sensitive=None,
+                                aliases_dynamic=True,
+                            )
+                            if kind == "pydantic_settings_base"
+                            else None
+                        ),
+                    )
                     for kind in _ALIAS_KINDS
                 ]
                 self._bind_options(name, bindings)
@@ -685,12 +895,19 @@ class _EnvVisitor(ast.NodeVisitor):
         for decorator in node.decorator_list:
             self.visit(decorator)
 
+        settings_config: Optional[_PydanticSettingsConfig] = None
         type_params = list(getattr(node, "type_params", []))
         if type_params:
             self._push_annotation_scope(type_params)
         try:
             for type_param in type_params:
                 self.visit(type_param)
+            base_configs = self._pydantic_base_configs(node.bases)
+            pydantic_fields: List[_PydanticField] = []
+            if base_configs:
+                settings_config, pydantic_fields = (
+                    self._analyze_pydantic_settings_class(node, base_configs)
+                )
             for base in node.bases:
                 self.visit(base)
             for keyword in node.keywords:
@@ -704,7 +921,429 @@ class _EnvVisitor(ast.NodeVisitor):
         finally:
             if type_params:
                 self._pop_scope()
-        self._bind(node.name, None)
+        if settings_config is None:
+            self._bind(node.name, None)
+        else:
+            self._record_pydantic_fields(pydantic_fields, settings_config)
+            self._bind(node.name, "pydantic_settings_base", settings_config)
+
+    def _pydantic_base_configs(
+        self, bases: List[ast.expr]
+    ) -> List[_PydanticSettingsConfig]:
+        configs = []
+        for base in bases:
+            for kind, config in self._value_bindings(base):
+                if kind != "pydantic_settings_base":
+                    continue
+                if isinstance(config, _PydanticSettingsConfig):
+                    configs.append(config)
+                else:
+                    configs.append(_PydanticSettingsConfig())
+        return configs
+
+    def _analyze_pydantic_settings_class(
+        self,
+        node: ast.ClassDef,
+        base_configs: List[_PydanticSettingsConfig],
+    ) -> Tuple[_PydanticSettingsConfig, List[_PydanticField]]:
+        inherited = self._inherit_pydantic_configs(base_configs)
+        config = self._copy_pydantic_config(inherited)
+        direct_fields: List[_PydanticField] = []
+        has_custom_sources = False
+        self._push_scope("class")
+        try:
+            for statement in node.body:
+                mutates_model_config = _mutates_pydantic_model_config(
+                    statement
+                )
+                if isinstance(statement, ast.Import):
+                    self.visit_Import(statement)
+                    continue
+                if isinstance(statement, ast.ImportFrom):
+                    self.visit_ImportFrom(statement)
+                    continue
+
+                if isinstance(statement, ast.AnnAssign):
+                    field_info = self._pydantic_field_info(statement)
+                    if field_info is not None:
+                        direct_fields.append(field_info)
+                    if (
+                        isinstance(statement.target, ast.Name)
+                        and statement.target.id == "model_config"
+                        and statement.value is not None
+                    ):
+                        # Only the last class namespace assignment survives.
+                        config = self._copy_pydantic_config(inherited)
+                        self._apply_pydantic_config(config, statement.value)
+                    if statement.value is not None:
+                        self._bind_assignment_target(
+                            statement.target,
+                            self._value_bindings(statement.value),
+                        )
+                    if mutates_model_config:
+                        self._make_pydantic_config_dynamic(config)
+                    continue
+
+                if isinstance(statement, ast.Assign):
+                    if any(
+                        isinstance(target, ast.Name)
+                        and target.id == "model_config"
+                        for target in statement.targets
+                    ):
+                        config = self._copy_pydantic_config(inherited)
+                        self._apply_pydantic_config(config, statement.value)
+                    bindings = self._value_bindings(statement.value)
+                    for target in statement.targets:
+                        self._bind_assignment_target(target, bindings)
+                    if mutates_model_config:
+                        self._make_pydantic_config_dynamic(config)
+                    continue
+
+                collector = _FunctionBindingCollector()
+                collector.visit(statement)
+                if "model_config" in collector.local_names:
+                    config = self._copy_pydantic_config(inherited)
+                    self._make_pydantic_config_dynamic(config)
+                elif mutates_model_config:
+                    self._make_pydantic_config_dynamic(config)
+
+                if isinstance(
+                    statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    if (
+                        isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and statement.name in {
+                            "settings_customise_sources",
+                            "customise_sources",
+                        }
+                    ):
+                        has_custom_sources = True
+                    self._bind(statement.name, None)
+                elif isinstance(statement, ast.Delete):
+                    for target in statement.targets:
+                        self._bind_target(target)
+                elif isinstance(statement, ast.AugAssign):
+                    self._bind_target(statement.target)
+        finally:
+            self._pop_scope()
+
+        # Pydantic class keywords take precedence over model_config.
+        for keyword in node.keywords:
+            if keyword.arg == "env_prefix":
+                config.prefix = _extract_string(keyword.value)
+            elif keyword.arg == "env_prefix_target":
+                config.prefix_target = _extract_prefix_target(keyword.value)
+            elif keyword.arg == "case_sensitive":
+                config.case_sensitive = _extract_bool(keyword.value)
+            elif keyword.arg == "alias_generator":
+                config.aliases_dynamic = not _is_none_literal(keyword.value)
+            elif keyword.arg in {"populate_by_name", "validate_by_name"}:
+                if _extract_bool(keyword.value) is not False:
+                    self._make_pydantic_config_dynamic(config)
+            elif keyword.arg == "env_ignore_empty":
+                if _extract_bool(keyword.value) is not False:
+                    self._make_pydantic_config_dynamic(config)
+            elif keyword.arg == "env_nested_delimiter":
+                if not _is_none_literal(keyword.value):
+                    self._make_pydantic_config_dynamic(config)
+
+        if has_custom_sources:
+            self._make_pydantic_config_dynamic(config)
+
+        fields_by_name = {
+            field_info.field_name: field_info
+            for field_info in inherited.fields
+        }
+        for field_info in direct_fields:
+            fields_by_name[field_info.field_name] = field_info
+        fields = list(fields_by_name.values())
+        config.fields = tuple(fields)
+        return config, fields
+
+    @staticmethod
+    def _copy_pydantic_config(
+        config: _PydanticSettingsConfig,
+    ) -> _PydanticSettingsConfig:
+        return _PydanticSettingsConfig(
+            prefix=config.prefix,
+            prefix_target=config.prefix_target,
+            case_sensitive=config.case_sensitive,
+            aliases_dynamic=config.aliases_dynamic,
+            fields=config.fields,
+        )
+
+    @staticmethod
+    def _make_pydantic_config_dynamic(
+        config: _PydanticSettingsConfig,
+    ) -> None:
+        config.prefix = None
+        config.prefix_target = None
+        config.case_sensitive = None
+        config.aliases_dynamic = True
+
+    def _apply_pydantic_config(
+        self,
+        config: _PydanticSettingsConfig,
+        value: ast.AST,
+    ) -> None:
+        values: Dict[str, ast.AST] = {}
+        if self._is_pydantic_config_call(value):
+            assert isinstance(value, ast.Call)
+            unpacked = (
+                len(value.args) > 1
+                or (
+                    bool(value.args)
+                    and (
+                        not isinstance(value.args[0], ast.Dict)
+                        or _dict_has_unpack(value.args[0])
+                    )
+                )
+                or any(keyword.arg is None for keyword in value.keywords)
+            )
+            if unpacked:
+                self._make_pydantic_config_dynamic(config)
+                return
+            if value.args:
+                assert isinstance(value.args[0], ast.Dict)
+                values.update(_literal_string_dict(value.args[0]))
+            for keyword in value.keywords:
+                if keyword.arg is not None:
+                    values[keyword.arg] = keyword.value
+        elif isinstance(value, ast.Dict):
+            if _dict_has_unpack(value):
+                self._make_pydantic_config_dynamic(config)
+                return
+            values.update(_literal_string_dict(value))
+        else:
+            self._make_pydantic_config_dynamic(config)
+            return
+
+        if "env_prefix" in values:
+            config.prefix = _extract_string(values["env_prefix"])
+        if "env_prefix_target" in values:
+            config.prefix_target = _extract_prefix_target(
+                values["env_prefix_target"]
+            )
+        if "case_sensitive" in values:
+            config.case_sensitive = _extract_bool(values["case_sensitive"])
+        if "alias_generator" in values:
+            config.aliases_dynamic = not _is_none_literal(
+                values["alias_generator"]
+            )
+        if any(
+            key in values and _extract_bool(values[key]) is not False
+            for key in ("populate_by_name", "validate_by_name", "env_ignore_empty")
+        ):
+            self._make_pydantic_config_dynamic(config)
+        if (
+            "env_nested_delimiter" in values
+            and not _is_none_literal(values["env_nested_delimiter"])
+        ):
+            self._make_pydantic_config_dynamic(config)
+
+    def _is_pydantic_config_call(self, node: ast.AST) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        if isinstance(func, ast.Name):
+            return self._is_alias(func.id, "pydantic_settings_config")
+        return (
+            isinstance(func, ast.Attribute)
+            and func.attr == "SettingsConfigDict"
+            and isinstance(func.value, ast.Name)
+            and self._is_alias(func.value.id, "pydantic_settings_mod")
+        )
+
+    def _pydantic_field_info(
+        self, node: ast.AnnAssign
+    ) -> Optional[_PydanticField]:
+        if not isinstance(node.target, ast.Name):
+            return None
+        name = node.target.id
+        if (
+            name == "model_config"
+            or name.startswith("_")
+            or _is_classvar_annotation(node.annotation)
+        ):
+            return None
+
+        field_calls = _annotated_metadata(node.annotation)
+        field_calls = [
+            call for call in field_calls if self._is_pydantic_field_call(call)
+        ]
+        value_field = (
+            node.value
+            if node.value is not None
+            and self._is_pydantic_field_call(node.value)
+            else None
+        )
+        if isinstance(value_field, ast.Call):
+            field_calls.append(value_field)
+
+        alias_node: Optional[ast.AST] = None
+        for call in field_calls:
+            validation_alias = _keyword_value(call, "validation_alias")
+            alias = _keyword_value(call, "alias")
+            if not _is_none_literal(validation_alias):
+                if validation_alias is not None:
+                    alias_node = validation_alias
+            elif not _is_none_literal(alias):
+                if alias is not None:
+                    alias_node = alias
+
+        if alias_node is None:
+            alias_names: Optional[Tuple[str, ...]] = ()
+            raw_alias = None
+        else:
+            alias_names = self._pydantic_alias_names(alias_node)
+            raw_alias = None if alias_names is not None else _unparse(alias_node)
+
+        has_default, default_node = self._pydantic_field_default(
+            node.value, field_calls
+        )
+        return _PydanticField(
+            node=node,
+            field_name=name,
+            alias_names=alias_names,
+            raw_alias=raw_alias,
+            has_default=has_default,
+            default_node=default_node,
+        )
+
+    def _is_pydantic_field_call(self, node: ast.AST) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        if isinstance(func, ast.Name):
+            return self._is_alias(func.id, "pydantic_field")
+        return (
+            isinstance(func, ast.Attribute)
+            and func.attr == "Field"
+            and isinstance(func.value, ast.Name)
+            and self._is_alias(func.value.id, "pydantic_mod")
+        )
+
+    def _pydantic_alias_names(
+        self, node: ast.AST
+    ) -> Optional[Tuple[str, ...]]:
+        name = _extract_string(node)
+        if name is not None:
+            return (name,)
+        if not isinstance(node, ast.Call):
+            return None
+        func = node.func
+        is_choices = (
+            isinstance(func, ast.Name)
+            and self._is_alias(func.id, "pydantic_alias_choices")
+        ) or (
+            isinstance(func, ast.Attribute)
+            and func.attr == "AliasChoices"
+            and isinstance(func.value, ast.Name)
+            and self._is_alias(func.value.id, "pydantic_mod")
+        )
+        if not is_choices or node.keywords or not node.args:
+            return None
+        names = tuple(_extract_string(arg) for arg in node.args)
+        if any(name is None for name in names):
+            return None
+        return tuple(name for name in names if name is not None)
+
+    @staticmethod
+    def _pydantic_field_default(
+        value: Optional[ast.AST],
+        field_calls: List[ast.Call],
+    ) -> Tuple[bool, Optional[ast.AST]]:
+        if value is not None and not (
+            isinstance(value, ast.Call) and value in field_calls
+        ):
+            if _is_ellipsis_literal(value):
+                return False, None
+            return True, value
+
+        for call in reversed(field_calls):
+            default = call.args[0] if call.args else _keyword_value(call, "default")
+            if default is not None:
+                if _is_ellipsis_literal(default):
+                    return False, None
+                return True, default
+            factory = _keyword_value(call, "default_factory")
+            if factory is not None and not _is_none_literal(factory):
+                return True, None
+        return False, None
+
+    def _record_pydantic_fields(
+        self,
+        fields: List[_PydanticField],
+        config: _PydanticSettingsConfig,
+    ) -> None:
+        for field_info in fields:
+            raw_expr: Optional[str] = None
+            if field_info.alias_names is None:
+                name = None
+                accepted_names: Tuple[str, ...] = ()
+                raw_expr = field_info.raw_alias
+            elif not field_info.alias_names and config.aliases_dynamic:
+                name = None
+                accepted_names = ()
+                if (
+                    config.prefix is None
+                    or config.prefix_target is None
+                    or config.case_sensitive is None
+                ):
+                    raw_expr = "model_config"
+                else:
+                    raw_expr = f"alias_generator({field_info.field_name!r})"
+            else:
+                is_alias = bool(field_info.alias_names)
+                base_names = (
+                    field_info.alias_names
+                    if is_alias else (field_info.field_name,)
+                )
+                target = config.prefix_target
+                if target is None and config.prefix != "":
+                    name = None
+                    accepted_names = ()
+                    raw_expr = "model_config['env_prefix_target']"
+                else:
+                    apply_prefix = (
+                        target in {"alias", "all"}
+                        if is_alias
+                        else target in {"variable", "all"}
+                    )
+                    if apply_prefix and config.prefix is None:
+                        name = None
+                        accepted_names = ()
+                        raw_expr = (
+                            "model_config['env_prefix'] + "
+                            f"{base_names[0]!r}"
+                        )
+                    else:
+                        prefix = config.prefix if apply_prefix else ""
+                        accepted_names = tuple(
+                            f"{prefix or ''}{base_name}"
+                            for base_name in base_names
+                        )
+                        name = accepted_names[0]
+
+            if config.case_sensitive is None:
+                name = None
+                accepted_names = ()
+                raw_expr = raw_expr or "model_config['case_sensitive']"
+
+            self._append_usage(
+                field_info.node,
+                EnvUsage(
+                    name=name,
+                    file=self.file_path,
+                    line=field_info.node.lineno,
+                    has_default=field_info.has_default,
+                    call_type="pydantic_settings",
+                    raw_expr=raw_expr,
+                    default_node=field_info.default_node,
+                    accepted_names=accepted_names,
+                    case_sensitive=config.case_sensitive,
+                ),
+            )
 
     def visit_If(self, node: ast.If) -> None:
         self.visit(node.test)
@@ -965,6 +1604,10 @@ class _EnvVisitor(ast.NodeVisitor):
                 self._bind(bound, "os")
             elif alias.name == "environ":
                 self._bind(bound, "django_environ_mod")
+            elif alias.name == "pydantic_settings":
+                self._bind(bound, "pydantic_settings_mod")
+            elif alias.name == "pydantic":
+                self._bind(bound, "pydantic_mod")
             else:
                 self._bind(bound, None)
 
@@ -980,6 +1623,16 @@ class _EnvVisitor(ast.NodeVisitor):
                 self._bind("getenv", "getenv")
                 self._bind("environ", "environ")
                 continue
+            if node.module == "pydantic_settings" and alias.name == "*":
+                self._bind("BaseSettings", "pydantic_settings_base")
+                self._bind(
+                    "SettingsConfigDict", "pydantic_settings_config"
+                )
+                continue
+            if node.module == "pydantic" and alias.name == "*":
+                self._bind("Field", "pydantic_field")
+                self._bind("AliasChoices", "pydantic_alias_choices")
+                continue
             kind = None
             if node.module == "os" and alias.name == "getenv":
                 kind = "getenv"
@@ -989,6 +1642,20 @@ class _EnvVisitor(ast.NodeVisitor):
                 kind = "decouple_config"
             elif node.module == "environ" and alias.name in {"Env", "FileAwareEnv"}:
                 kind = "environ_env_class"
+            elif (
+                node.module == "pydantic_settings"
+                and alias.name == "BaseSettings"
+            ):
+                kind = "pydantic_settings_base"
+            elif (
+                node.module == "pydantic_settings"
+                and alias.name == "SettingsConfigDict"
+            ):
+                kind = "pydantic_settings_config"
+            elif node.module == "pydantic" and alias.name == "Field":
+                kind = "pydantic_field"
+            elif node.module == "pydantic" and alias.name == "AliasChoices":
+                kind = "pydantic_alias_choices"
             self._bind(bound, kind)
 
     def visit_Assign(self, node: ast.Assign) -> None:
@@ -1141,7 +1808,12 @@ class _EnvVisitor(ast.NodeVisitor):
         if isinstance(value, ast.Name):
             bindings = []
             for kind in sorted(self._binding_kinds(value.id)):
-                config = self._env_config(value.id) if kind == "environ_env" else None
+                if kind == "environ_env":
+                    config: Optional[_BindingConfig] = self._env_config(value.id)
+                elif kind == "pydantic_settings_base":
+                    config = self._pydantic_config(value.id)
+                else:
+                    config = None
                 bindings.append((kind, config))
             return bindings
         if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name):
@@ -1157,6 +1829,21 @@ class _EnvVisitor(ast.NodeVisitor):
                 and value.attr in {"Env", "FileAwareEnv"}
             ):
                 bindings.append(("environ_env_class", None))
+            if self._is_alias(owner, "pydantic_settings_mod"):
+                if value.attr == "BaseSettings":
+                    bindings.append(
+                        (
+                            "pydantic_settings_base",
+                            _PydanticSettingsConfig(),
+                        )
+                    )
+                elif value.attr == "SettingsConfigDict":
+                    bindings.append(("pydantic_settings_config", None))
+            if self._is_alias(owner, "pydantic_mod"):
+                if value.attr == "Field":
+                    bindings.append(("pydantic_field", None))
+                elif value.attr == "AliasChoices":
+                    bindings.append(("pydantic_alias_choices", None))
             return bindings
         if isinstance(value, ast.Call) and self._is_env_constructor(value):
             return [("environ_env", self._constructor_config(value))]
@@ -1328,6 +2015,8 @@ class _EnvVisitor(ast.NodeVisitor):
             usage.raw_expr,
             usage.has_default,
             default_expr,
+            usage.accepted_names,
+            usage.case_sensitive,
         )
         if key in self._usage_keys:
             return
@@ -1423,6 +2112,151 @@ def _schema_default(node: ast.AST) -> Optional[ast.AST]:
     return None
 
 
+def _literal_string_dict(node: ast.Dict) -> Dict[str, ast.AST]:
+    result: Dict[str, ast.AST] = {}
+    for key, value in zip(node.keys, node.values):
+        name = _extract_string(key)
+        if name is not None:
+            result[name] = value
+    return result
+
+
+def _dict_has_unpack(node: ast.Dict) -> bool:
+    return any(key is None for key in node.keys)
+
+
+def _extract_prefix_target(node: Optional[ast.AST]) -> Optional[str]:
+    target = _extract_string(node)
+    if target in {"variable", "alias", "all"}:
+        return target
+    return None
+
+
+class _ModelConfigUseFinder(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.found = False
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if node.id == "model_config" and isinstance(node.ctx, ast.Load):
+            self.found = True
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_function_header(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_function_header(node)
+
+    def _visit_function_header(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+    ) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        self.visit(node.args)
+        if node.returns is not None:
+            self.visit(node.returns)
+        for type_param in getattr(node, "type_params", ()):
+            self.visit(type_param)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self.visit(node.args)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for base in node.bases:
+            self.visit(base)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+        for type_param in getattr(node, "type_params", ()):
+            self.visit(type_param)
+
+
+def _mutates_pydantic_model_config(node: ast.AST) -> bool:
+    finder = _ModelConfigUseFinder()
+    finder.visit(node)
+    return finder.found
+
+
+def _pydantic_field_key(field_info: _PydanticField) -> Tuple[object, ...]:
+    return (
+        field_info.field_name,
+        field_info.node.lineno,
+        field_info.alias_names,
+        field_info.raw_alias,
+        field_info.has_default,
+        (
+            _unparse(field_info.default_node)
+            if field_info.default_node is not None else None
+        ),
+    )
+
+
+def _extract_bool(node: Optional[ast.AST]) -> Optional[bool]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, bool):
+        return node.value
+    return None
+
+
+def _keyword_value(call: ast.Call, name: str) -> Optional[ast.AST]:
+    return next(
+        (
+            keyword.value
+            for keyword in call.keywords
+            if keyword.arg == name
+        ),
+        None,
+    )
+
+
+def _is_none_literal(node: Optional[ast.AST]) -> bool:
+    return node is None or (
+        isinstance(node, ast.Constant) and node.value is None
+    )
+
+
+def _is_ellipsis_literal(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and node.value is Ellipsis
+
+
+def _annotated_metadata(annotation: ast.AST) -> List[ast.Call]:
+    if not isinstance(annotation, ast.Subscript):
+        return []
+    owner = annotation.value
+    if not (
+        (isinstance(owner, ast.Name) and owner.id == "Annotated")
+        or (isinstance(owner, ast.Attribute) and owner.attr == "Annotated")
+    ):
+        return []
+    value = _subscript_key(annotation)
+    if not isinstance(value, ast.Tuple):
+        return []
+    return [
+        item for item in value.elts[1:]
+        if isinstance(item, ast.Call)
+    ]
+
+
+def _is_classvar_annotation(annotation: ast.AST) -> bool:
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        text = annotation.value.replace(" ", "")
+        return text.startswith("ClassVar[") or ".ClassVar[" in text
+    if isinstance(annotation, ast.Subscript):
+        owner = annotation.value
+        if (
+            (isinstance(owner, ast.Name) and owner.id == "ClassVar")
+            or (isinstance(owner, ast.Attribute) and owner.attr == "ClassVar")
+        ):
+            return True
+        annotated_owner = (
+            (isinstance(owner, ast.Name) and owner.id == "Annotated")
+            or (isinstance(owner, ast.Attribute) and owner.attr == "Annotated")
+        )
+        inner = _subscript_key(annotation)
+        if annotated_owner and isinstance(inner, ast.Tuple) and inner.elts:
+            return _is_classvar_annotation(inner.elts[0])
+    return False
+
+
 def _is_irrefutable_pattern(node: ast.AST) -> bool:
     match_as = getattr(ast, "MatchAs", ())
     if isinstance(node, match_as):
@@ -1505,6 +2339,8 @@ DEFAULT_EXCLUDES = frozenset({
 
 DEFAULT_EXTENSIONS = frozenset({".py"})
 MAX_FILE_SIZE = 2 * 1024 * 1024
+MAX_SCAN_FILES = 25_000
+MAX_SCAN_USAGES = 50_000
 
 
 def iter_python_files(
@@ -1550,6 +2386,10 @@ def iter_python_files(
         for filename in filenames:
             path = current_path / filename
             if path.suffix.casefold() in exts:
+                if len(files) >= MAX_SCAN_FILES:
+                    raise ScanError(
+                        f"scan contains more than {MAX_SCAN_FILES} files"
+                    )
                 files.append(path)
     return sorted(files, key=lambda path: os.path.normcase(str(path)))
 
@@ -1580,12 +2420,33 @@ def scan_project(
     else:
         scan_files = list(files)
 
+    if len(scan_files) > MAX_SCAN_FILES:
+        result.errors.append((
+            root,
+            f"scan contains more than {MAX_SCAN_FILES} files",
+        ))
+        return result
+
     result.scanned_files = scan_files
     for path in scan_files:
         try:
-            result.usages.extend(scan_file(path))
+            file_usages = scan_file(path)
         except ScanError as exc:
             result.errors.append((path, str(exc)))
+        else:
+            remaining = MAX_SCAN_USAGES - len(result.usages)
+            if len(file_usages) > remaining:
+                if remaining > 0:
+                    result.usages.extend(file_usages[:remaining])
+                result.errors.append((
+                    path,
+                    f"scan found more than {MAX_SCAN_USAGES} "
+                    "environment-variable usages",
+                ))
+                if on_file is not None:
+                    on_file(path)
+                break
+            result.usages.extend(file_usages)
         if on_file is not None:
             on_file(path)
     return result

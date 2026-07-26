@@ -128,6 +128,9 @@ def _pick_default(usages: List[EnvUsage]) -> Tuple[Optional[str], bool]:
     for u in sorted(usages, key=_usage_sort_key):
         if not u.has_default:
             continue
+        if u.call_type == "pydantic_settings" and u.default_node is None:
+            found_unportable = True
+            continue
         val, should_explain = _literal_from_node(u.default_node)
         if val is None:
             found_unportable = found_unportable or should_explain
@@ -166,15 +169,27 @@ def _validate_scan(scan: ScanResult) -> None:
     )
     if invalid:
         raise InvalidEnvNameError(invalid)
-    if not _env_names_case_sensitive():
-        by_folded_name: dict = {}
-        for name in scan.static_names:
-            by_folded_name.setdefault(name.casefold(), []).append(name)
-        collisions = [
-            names for names in by_folded_name.values() if len(names) > 1
-        ]
-        if collisions:
-            raise EnvNameCollisionError(collisions)
+    by_folded_name: dict = {}
+    case_insensitive_names = set()
+    for usage in scan.usages:
+        if usage.name is None:
+            continue
+        by_folded_name.setdefault(
+            usage.name.casefold(), set(),
+        ).add(usage.name)
+        usage_mode = getattr(usage, "case_sensitive", None)
+        if usage_mode is False:
+            case_insensitive_names.add(usage.name.casefold())
+
+    platform_is_insensitive = not _env_names_case_sensitive()
+    collisions = [
+        sorted(names)
+        for folded, names in by_folded_name.items()
+        if len(names) > 1
+        and (platform_is_insensitive or folded in case_insensitive_names)
+    ]
+    if collisions:
+        raise EnvNameCollisionError(collisions)
 
 
 def _append_dynamic_warning(lines: List[str], usages: List[EnvUsage]) -> None:
@@ -225,6 +240,16 @@ def build_env_example(scan: ScanResult) -> str:
         if len(usages) > 3:
             locations.append(f"...and {len(usages) - 3} more")
         lines.append(f"# used at {', '.join(locations)}")
+
+        accepted = sorted({
+            candidate
+            for usage in usages
+            for candidate in getattr(usage, "accepted_names", ())
+            if candidate != name
+        })
+        if accepted:
+            shown = ", ".join(_one_line(candidate) for candidate in accepted)
+            lines.append(f"# also accepts: {shown}")
 
         default, default_was_omitted = _pick_default(usages)
         if default_was_omitted:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import fnmatch
 import os
+import re
 import stat
 import string
 from dataclasses import dataclass, field
@@ -20,6 +21,13 @@ from envsleuth.scanner import EnvUsage, ScanResult
 
 DEFAULT_ENV_FILE = ".env"
 DEFAULT_ENVIGNORE_FILE = ".envignore"
+MAX_ENV_FILE_SIZE = 16 * 1024 * 1024
+MAX_ENV_BINDINGS = 25_000
+MAX_ENV_LINES = 100_000
+MAX_IGNORE_FILE_SIZE = 1024 * 1024
+MAX_IGNORE_PATTERNS = 1024
+MAX_IGNORE_PATTERN_LENGTH = 1024
+_IGNORE_REGEX_CHUNK_SIZE = 64
 
 
 class EnvFileParseError(OSError):
@@ -35,6 +43,7 @@ class VarReport:
     has_default_in_code: bool
     usages: List[EnvUsage] = field(default_factory=list)
     ignored: bool = False
+    missing_usages: List[EnvUsage] = field(default_factory=list)
 
     @property
     def status(self) -> str:
@@ -59,6 +68,7 @@ class CheckReport:
     extra_in_env: List[str] = field(default_factory=list)
     ignore_patterns: List[str] = field(default_factory=list)
     errors: List[Tuple[Path, str]] = field(default_factory=list)
+    env_binding_count: int = 0
 
     @property
     def missing(self) -> List[VarReport]:
@@ -87,7 +97,17 @@ class CheckReport:
 
 
 def _parse_env_text(path: Path, text: str) -> Dict[str, Optional[str]]:
+    line_count = text.count("\n")
+    if text and not text.endswith("\n"):
+        line_count += 1
+    if line_count > MAX_ENV_LINES:
+        raise EnvFileParseError(
+            f"{path}: environment file has more than "
+            f"{MAX_ENV_LINES} lines"
+        )
+
     stream = StringIO(text)
+    binding_count = 0
     for binding in parse_stream(stream):
         if binding.error:
             raise EnvFileParseError(
@@ -99,9 +119,16 @@ def _parse_env_text(path: Path, text: str) -> Dict[str, Optional[str]]:
             raise EnvFileParseError(
                 f"{path}: NUL byte at line {binding.original.line}"
             )
+        if binding.key is not None:
+            binding_count += 1
+            if binding_count > MAX_ENV_BINDINGS:
+                raise EnvFileParseError(
+                    f"{path}: environment file has more than "
+                    f"{MAX_ENV_BINDINGS} bindings"
+                )
 
     stream.seek(0)
-    return dict(dotenv_values(stream=stream))
+    return dict(dotenv_values(stream=stream, interpolate=False))
 
 
 def _load_env_file_snapshot(
@@ -119,13 +146,24 @@ def _load_env_file_snapshot(
         file_info = os.fstat(descriptor)
         if not stat.S_ISREG(file_info.st_mode):
             raise OSError(f"{path}: not a regular file")
-        with os.fdopen(descriptor, "r", encoding="utf-8-sig") as source:
+        if file_info.st_size > MAX_ENV_FILE_SIZE:
+            raise OSError(
+                f"{path}: environment file is larger than "
+                f"{MAX_ENV_FILE_SIZE} bytes"
+            )
+        with os.fdopen(descriptor, "rb") as source:
             descriptor = -1
-            text = source.read()
+            raw = source.read(MAX_ENV_FILE_SIZE + 1)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
 
+    if len(raw) > MAX_ENV_FILE_SIZE:
+        raise OSError(
+            f"{path}: environment file is larger than "
+            f"{MAX_ENV_FILE_SIZE} bytes"
+        )
+    text = raw.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
     return True, _parse_env_text(path, text)
 
 
@@ -135,14 +173,64 @@ def load_env_file(path: Path) -> Dict[str, Optional[str]]:
 
 def load_ignore_patterns(path: Path, *, required: bool = False) -> List[str]:
     """Read .envignore — one glob pattern per line. Blank lines and '#' are ignored."""
-    if not required and not path.is_file():
-        return []
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        if not required:
+            return []
+        raise
+    except PermissionError:
+        try:
+            non_regular = path.exists() and not path.is_file()
+        except OSError:
+            non_regular = False
+        if non_regular:
+            raise OSError(f"{path}: not a regular file") from None
+        raise
+
+    try:
+        file_info = os.fstat(descriptor)
+        if not stat.S_ISREG(file_info.st_mode):
+            raise OSError(f"{path}: not a regular file")
+        if file_info.st_size > MAX_IGNORE_FILE_SIZE:
+            raise OSError(
+                f"{path}: ignore file is larger than "
+                f"{MAX_IGNORE_FILE_SIZE} bytes"
+            )
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = -1
+            raw_bytes = source.read(MAX_IGNORE_FILE_SIZE + 1)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    if len(raw_bytes) > MAX_IGNORE_FILE_SIZE:
+        raise OSError(
+            f"{path}: ignore file is larger than "
+            f"{MAX_IGNORE_FILE_SIZE} bytes"
+        )
+    text = raw_bytes.decode("utf-8-sig")
     patterns: List[str] = []
-    for raw in path.read_text(encoding="utf-8-sig").splitlines():
+    for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
+        if len(line) > MAX_IGNORE_PATTERN_LENGTH:
+            raise OSError(
+                f"{path}: ignore pattern is longer than "
+                f"{MAX_IGNORE_PATTERN_LENGTH} characters"
+            )
+        if any(not char.isprintable() for char in line):
+            raise OSError(f"{path}: ignore pattern contains control characters")
         patterns.append(line)
+        if len(patterns) > MAX_IGNORE_PATTERNS:
+            raise OSError(
+                f"{path}: ignore file has more than "
+                f"{MAX_IGNORE_PATTERNS} patterns"
+            )
     return patterns
 
 
@@ -150,19 +238,39 @@ def _env_names_case_sensitive() -> bool:
     return os.name != "nt"
 
 
-def _name_key(name: str, case_sensitive: bool) -> str:
-    return name if case_sensitive else name.casefold()
+def _compile_pattern_chunks(patterns: List[str]) -> Tuple[re.Pattern, ...]:
+    chunks = []
+    for offset in range(0, len(patterns), _IGNORE_REGEX_CHUNK_SIZE):
+        translated = [
+            f"(?:{fnmatch.translate(pattern)})"
+            for pattern in patterns[offset:offset + _IGNORE_REGEX_CHUNK_SIZE]
+        ]
+        chunks.append(re.compile("|".join(translated)))
+    return tuple(chunks)
 
 
-def _matches_any(
-    name: str,
-    patterns: List[str],
-    case_sensitive: bool = True,
-) -> bool:
-    if case_sensitive:
-        return any(fnmatch.fnmatchcase(name, p) for p in patterns)
-    folded = name.casefold()
-    return any(fnmatch.fnmatchcase(folded, p.casefold()) for p in patterns)
+class _IgnoreMatcher:
+    def __init__(self, patterns: List[str]) -> None:
+        if len(patterns) > MAX_IGNORE_PATTERNS:
+            raise OSError(
+                f"ignore pattern list has more than "
+                f"{MAX_IGNORE_PATTERNS} entries"
+            )
+        for pattern in patterns:
+            if len(pattern) > MAX_IGNORE_PATTERN_LENGTH:
+                raise OSError(
+                    f"ignore pattern is longer than "
+                    f"{MAX_IGNORE_PATTERN_LENGTH} characters"
+                )
+        self._exact = _compile_pattern_chunks(patterns)
+        self._folded = _compile_pattern_chunks([
+            pattern.casefold() for pattern in patterns
+        ])
+
+    def matches(self, name: str, case_sensitive: bool = True) -> bool:
+        value = name if case_sensitive else name.casefold()
+        expressions = self._exact if case_sensitive else self._folded
+        return any(expression.match(value) is not None for expression in expressions)
 
 
 _DynamicPattern = Tuple[Optional[str], ...]
@@ -467,12 +575,32 @@ def _merge_dynamic_parts(parts: List[Optional[str]]) -> List[Optional[str]]:
 
 
 def _has_usable_default(usage: EnvUsage) -> bool:
-    if not usage.has_default or usage.default_node is None:
+    if not usage.has_default:
+        return False
+    if usage.call_type == "pydantic_settings":
+        return True
+    if usage.default_node is None:
         return False
     return not (
         isinstance(usage.default_node, ast.Constant)
         and usage.default_node.value is None
     )
+
+
+def _usage_names(usage: EnvUsage) -> Tuple[str, ...]:
+    alternatives = getattr(usage, "accepted_names", ())
+    if alternatives:
+        return tuple(alternatives)
+    if usage.name is None:
+        return ()
+    return (usage.name,)
+
+
+def _usage_case_sensitive(
+    usage: EnvUsage, platform_default: bool,
+) -> bool:
+    setting = getattr(usage, "case_sensitive", None)
+    return platform_default if setting is None else bool(setting)
 
 
 # -------------------------------------------------------------------- main api
@@ -485,57 +613,135 @@ def check(
 ) -> CheckReport:
     """Compare scan results against the given .env file and return a report."""
     patterns = ignore_patterns or []
-    case_sensitive = _env_names_case_sensitive()
+    ignore_matcher = _IgnoreMatcher(patterns)
+    platform_case_sensitive = _env_names_case_sensitive()
     env_file_exists, env_values = _load_env_file_snapshot(env_path)
-    env_names: Dict[str, str] = {}
+    actual_env_names: List[str] = []
     for name, value in env_values.items():
         # A bare `NAME` entry is ignored by load_dotenv, unlike `NAME=`.
         if value is not None:
-            env_names[_name_key(name, case_sensitive)] = name
-    env_keys = set(env_names)
+            actual_env_names.append(name)
+    exact_env_keys = set(actual_env_names)
+    folded_env_keys = {name.casefold() for name in actual_env_names}
 
-    by_name: Dict[str, List[EnvUsage]] = {}
-    for u in scan.usages:
-        if u.name is None:
-            continue
-        by_name.setdefault(_name_key(u.name, case_sensitive), []).append(u)
+    static_usages = [usage for usage in scan.usages if usage.name is not None]
+    parents = list(range(len(static_usages)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    exact_groups: Dict[str, int] = {}
+    insensitive_groups: Dict[str, int] = {}
+    for index, usage in enumerate(static_usages):
+        name = usage.name
+        previous = exact_groups.setdefault(name, index)
+        union(index, previous)
+        if not _usage_case_sensitive(usage, platform_case_sensitive):
+            folded = name.casefold()
+            previous = insensitive_groups.setdefault(folded, index)
+            union(index, previous)
+
+    by_name: Dict[int, List[EnvUsage]] = {}
+    for index, usage in enumerate(static_usages):
+        by_name.setdefault(find(index), []).append(usage)
 
     variables: List[VarReport] = []
-    for name_key in sorted(by_name):
-        usages = by_name[name_key]
+    sorted_groups = sorted(
+        by_name.values(),
+        key=lambda usages: min(
+            (usage.name.casefold(), usage.name)
+            for usage in usages
+            if usage.name is not None
+        ),
+    )
+    for usages in sorted_groups:
         names = {u.name for u in usages if u.name is not None}
         name = sorted(names, key=lambda item: (item.casefold(), item))[0]
-        # bug fix: was `any()` before — meant a single defaulted usage masked
-        # other call sites that would actually crash on missing var. now we
-        # only call it 'has default' if every usage provides one.
-        has_default = bool(usages) and all(_has_usable_default(u) for u in usages)
-        ignored = _matches_any(name, patterns, case_sensitive)
+
+        def usage_is_present(usage: EnvUsage) -> bool:
+            mode = _usage_case_sensitive(usage, platform_case_sensitive)
+            candidates = _usage_names(usage)
+            if mode:
+                return any(candidate in exact_env_keys for candidate in candidates)
+            return any(
+                candidate.casefold() in folded_env_keys
+                for candidate in candidates
+            )
+
+        present = bool(usages) and all(usage_is_present(u) for u in usages)
+        has_default = bool(usages) and all(
+            usage_is_present(u) or _has_usable_default(u) for u in usages
+        )
+        missing_usages = [
+            usage for usage in usages
+            if not usage_is_present(usage)
+            and not _has_usable_default(usage)
+        ]
+        ignored = any(
+            ignore_matcher.matches(
+                candidate,
+                _usage_case_sensitive(usage, platform_case_sensitive),
+            )
+            for usage in usages
+            for candidate in _usage_names(usage)
+        )
         variables.append(
             VarReport(
                 name=name,
-                present_in_env=name_key in env_keys,
+                present_in_env=present,
                 has_default_in_code=has_default,
                 usages=usages,
                 ignored=ignored,
+                missing_usages=missing_usages,
             )
         )
 
-    code_names = set(by_name.keys())
-    dynamic_patterns = [
-        parts
-        for usage in scan.dynamic_usages
-        if (parts := _dynamic_name_parts(usage.raw_expr or "")) is not None
-    ]
-    dynamic_index = _build_dynamic_pattern_index(
-        dynamic_patterns, case_sensitive
+    code_names_exact: Set[str] = set()
+    code_names_folded: Set[str] = set()
+    for usage in scan.usages:
+        if usage.name is None:
+            continue
+        mode = _usage_case_sensitive(usage, platform_case_sensitive)
+        for candidate in _usage_names(usage):
+            if mode:
+                code_names_exact.add(candidate)
+            else:
+                code_names_folded.add(candidate.casefold())
+
+    dynamic_patterns: Dict[bool, List[List[Optional[str]]]] = {
+        True: [],
+        False: [],
+    }
+    for usage in scan.dynamic_usages:
+        parts = _dynamic_name_parts(usage.raw_expr or "")
+        if parts is None:
+            continue
+        mode = _usage_case_sensitive(usage, platform_case_sensitive)
+        dynamic_patterns[mode].append(parts)
+    dynamic_indexes = (
+        _build_dynamic_pattern_index(dynamic_patterns[True], True),
+        _build_dynamic_pattern_index(dynamic_patterns[False], False),
     )
     # if user told us to ignore TEST_*, they probably don't want TEST_FOO in .env
     # showing up as "unused" either
-    extras_raw = env_keys - code_names
     extra_in_env = sorted(
-        env_names[n] for n in extras_raw
-        if not _matches_any(env_names[n], patterns, case_sensitive)
-        and not _looks_like_dynamic_match(env_names[n], dynamic_index)
+        name for name in actual_env_names
+        if name not in code_names_exact
+        and name.casefold() not in code_names_folded
+        and not ignore_matcher.matches(name, platform_case_sensitive)
+        and not any(
+            _looks_like_dynamic_match(name, index)
+            for index in dynamic_indexes
+        )
     )
 
     return CheckReport(
@@ -546,6 +752,7 @@ def check(
         extra_in_env=extra_in_env,
         ignore_patterns=patterns,
         errors=list(scan.errors),
+        env_binding_count=len(env_values),
     )
 
 

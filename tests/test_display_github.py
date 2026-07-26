@@ -40,6 +40,27 @@ def test_emits_error_for_missing_var(tmp_path: Path, monkeypatch) -> None:
     assert "title=Missing env var" in out
 
 
+def test_missing_annotation_skips_usage_with_usable_default(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write(tmp_path, "src/a_defaulted.py", """
+        import os
+        os.getenv("TOKEN", "fallback")
+    """)
+    write(tmp_path, "src/z_required.py", """
+        import os
+        os.environ["TOKEN"]
+    """)
+    env = write(tmp_path, ".env", "")
+
+    report = check(scan_project(Path("src")), env)
+    out = render_report_github(report)
+
+    assert "z_required.py" in out
+    assert "a_defaulted.py" not in out
+
+
 def test_emits_warning_for_dynamic(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     write(tmp_path, "src/app.py", """
